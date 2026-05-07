@@ -1,0 +1,24 @@
+venv/
+.venv/
+.venv_tf/
+frontend/node_modules/
+frontend/dist/
+__pycache__/
+*.pyc
+.idea/
+.DS_Store
+
+# Generated model artifacts and reports
+*.pt
+*.pkl
+xgboost_*_model.json
+*.png
+!frontend/src/assets/
+!frontend/src/assets/*.png
+rf_*.csv
+lstm_*.csv
+model_comparison.csv
+combined_recommendations.csv
+investment_recommendations.csv
+merge_signals_report.txt
+portfolio_store.json
