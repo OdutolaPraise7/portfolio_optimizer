@@ -1,4 +1,5 @@
 import re
+import os
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
@@ -10,6 +11,12 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 PRICE_FILE = PROJECT_ROOT / "PRICE_LIST.csv"
 SIGNAL_FILE = PROJECT_ROOT / "signal_store.csv"
 STALE_SIGNAL_HOURS = 24 * 7
+ENFORCE_SIGNAL_FRESHNESS = os.getenv("ENFORCE_SIGNAL_FRESHNESS", "0").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 PRICE_SNAPSHOT_LOCK = Lock()
 SIGNAL_SNAPSHOT_LOCK = Lock()
@@ -132,14 +139,15 @@ def get_latest_price_snapshot(price_file: str | Path = PRICE_FILE) -> Dict[str, 
     }
 
 
-def _load_signal_rows(signal_file: str | Path, stale_after_hours: int) -> Tuple[List[Dict[str, str]], str]:
+def _load_signal_rows(signal_file: str | Path, stale_after_hours: int) -> Tuple[List[Dict[str, str]], str, bool, float]:
     path = Path(signal_file)
     if not path.exists():
         raise SnapshotError(f"Signal store not found at '{signal_file}'. Run merge_signals.py first.")
 
     modified_at = datetime.fromtimestamp(path.stat().st_mtime)
     age_hours = (datetime.now() - modified_at).total_seconds() / 3600
-    if age_hours > stale_after_hours:
+    is_stale = age_hours > stale_after_hours
+    if ENFORCE_SIGNAL_FRESHNESS and is_stale:
         raise SnapshotError(
             f"Signal store is stale ({age_hours:.1f}h old). Refresh it by running merge_signals.py."
         )
@@ -148,7 +156,7 @@ def _load_signal_rows(signal_file: str | Path, stale_after_hours: int) -> Tuple[
     with SIGNAL_SNAPSHOT_LOCK:
         rows = _load_signal_rows_cached(*signature)
 
-    return [dict(row) for row in rows], modified_at.isoformat()
+    return [dict(row) for row in rows], modified_at.isoformat(), is_stale, age_hours
 
 
 @lru_cache(maxsize=4)
@@ -184,7 +192,7 @@ def get_signal_summary(
     signal_file: str | Path = SIGNAL_FILE,
     stale_after_hours: int = STALE_SIGNAL_HOURS,
 ) -> Dict[str, object]:
-    rows, generated_at = _load_signal_rows(signal_file, stale_after_hours)
+    rows, generated_at, is_stale, age_hours = _load_signal_rows(signal_file, stale_after_hours)
     signals = [str(row.get("Consensus_Signal", "")).upper() for row in rows]
     confidences = [_coerce_float(row.get("Avg_Confidence")) for row in rows]
     r2_values = [_coerce_float(row.get("Avg_R2")) for row in rows]
@@ -197,6 +205,8 @@ def get_signal_summary(
         "conflict_count": signals.count("CONFLICT"),
         "avg_confidence": round(sum(confidences) / len(confidences), 4) if confidences else 0.0,
         "avg_r2": round(sum(r2_values) / len(r2_values), 4) if r2_values else 0.0,
+        "is_stale": is_stale,
+        "age_hours": round(age_hours, 1),
     }
 
 
@@ -205,7 +215,7 @@ def get_signal_watchlist(
     stale_after_hours: int = STALE_SIGNAL_HOURS,
     limit: int = 5,
 ) -> Dict[str, object]:
-    rows, _ = _load_signal_rows(signal_file, stale_after_hours)
+    rows, _, _, _ = _load_signal_rows(signal_file, stale_after_hours)
 
     def serialize(row: Dict[str, str]) -> Dict[str, object]:
         symbol = str(row.get("Symbol", "")).upper()

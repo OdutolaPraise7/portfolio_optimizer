@@ -1,4 +1,5 @@
 import math
+import os
 import re
 from dataclasses import dataclass, replace
 from functools import lru_cache
@@ -14,6 +15,12 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 PRICE_FILE = str(PROJECT_ROOT / "PRICE_LIST.csv")
 SIGNAL_FILE = str(PROJECT_ROOT / "signal_store.csv")
 STALE_SIGNAL_HOURS = 24 * 7
+ENFORCE_SIGNAL_FRESHNESS = os.getenv("ENFORCE_SIGNAL_FRESHNESS", "0").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 PRICE_CACHE_LOCK = Lock()
 SIGNAL_CACHE_LOCK = Lock()
 MIN_SIGNAL_CONFIDENCE = 0.02
@@ -381,7 +388,7 @@ def load_signal_store(
     age_hours = (
         pd.Timestamp.now() - pd.Timestamp(path.stat().st_mtime, unit="s")
     ).total_seconds() / 3600
-    if age_hours > stale_after_hours:
+    if ENFORCE_SIGNAL_FRESHNESS and age_hours > stale_after_hours:
         raise SignalStoreError(
             f"Signal store is stale ({age_hours:.1f}h old). Refresh it by running merge_signals.py."
         )
