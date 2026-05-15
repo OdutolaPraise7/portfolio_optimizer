@@ -1,10 +1,9 @@
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
 from typing import Any, Dict, List
 from uuid import uuid4
-
-import pandas as pd
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -25,7 +24,7 @@ class PortfolioStoreValidationError(PortfolioStoreError):
 
 
 def _now() -> str:
-    return pd.Timestamp.now("UTC").isoformat()
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _new_id(prefix: str) -> str:

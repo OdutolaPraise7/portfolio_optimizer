@@ -3,7 +3,6 @@ import { useEffect, useMemo, useState } from 'react';
 import type {
   FundManager,
   Holding,
-  LatestPricesResponse,
   MandateProfile,
   OptimizationResponse,
   OptimizedAllocation,
@@ -17,6 +16,15 @@ const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://127.0.0.1:8000
 type RebalanceFrequency = 'weekly' | 'monthly' | 'quarterly';
 type NavTab = 'overview' | 'watchlist' | 'input' | 'dashboard' | 'workspace' | 'data';
 type ConsumerPortfolioStatus = 'existing' | 'new';
+type BootstrapResponse = {
+  symbols?: string[];
+  prices?: Record<string, number>;
+  price_updated_at?: string | null;
+  signal_summary?: SignalSummary | null;
+  watchlist?: SignalWatchlist | null;
+  managers?: FundManager[];
+  signal_error?: string;
+};
 
 const riskDescriptions: Record<RiskProfile, string> = {
   conservative: 'Tighter caps, lower turnover, steadier allocations.',
@@ -216,24 +224,20 @@ function App() {
   useEffect(() => {
     (async () => {
       try {
-        const [sR, pR, sigR, wR, mR] = await Promise.all([
-          fetch(`${API_BASE_URL}/symbols`, { cache: 'no-store' }),
-          fetch(`${API_BASE_URL}/prices/latest`, { cache: 'no-store' }),
-          fetch(`${API_BASE_URL}/signals/summary`, { cache: 'no-store' }),
-          fetch(`${API_BASE_URL}/signals/watchlist`, { cache: 'no-store' }),
-          fetch(`${API_BASE_URL}/fund-managers`, { cache: 'no-store' }),
-        ]);
-        if (sR.ok) { const d = await sR.json(); setSymbols(d.symbols ?? []); }
-        if (pR.ok) { const d: LatestPricesResponse = await pR.json(); setPrices(d.prices ?? {}); setPriceUpdatedAt(d.updated_at ?? null); }
-        if (sigR.ok) { const d: SignalSummary = await sigR.json(); setSignalSummary(d); }
-        else { const d = await sigR.json(); setError(d.detail ?? 'Could not load signal summary.'); }
-        if (wR.ok) { const d = await wR.json(); setWatchlist(d); }
-        if (mR.ok) {
-          const d = await mR.json();
-          const loadedManagers: FundManager[] = d.managers ?? [];
-          setManagers(loadedManagers);
-          setSelectedManagerId((current) => current || loadedManagers[0]?.id || '');
-        }
+        const response = await fetch(`${API_BASE_URL}/bootstrap`, { cache: 'no-store' });
+        const data: BootstrapResponse & { detail?: string } = await response.json();
+        if (!response.ok) throw new Error(data.detail ?? 'Failed to load data.');
+
+        setSymbols(data.symbols ?? []);
+        setPrices(data.prices ?? {});
+        setPriceUpdatedAt(data.price_updated_at ?? null);
+        setSignalSummary(data.signal_summary ?? null);
+        setWatchlist(data.watchlist ?? null);
+        if (data.signal_error) setError(data.signal_error);
+
+        const loadedManagers = data.managers ?? [];
+        setManagers(loadedManagers);
+        setSelectedManagerId((current) => current || loadedManagers[0]?.id || '');
       } catch (e) {
         setError(e instanceof Error ? e.message : 'Failed to load data.');
       }
