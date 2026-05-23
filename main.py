@@ -16,9 +16,13 @@ from portfolio_store import (
     PortfolioNotFoundError,
     PortfolioStoreError,
     PortfolioStoreValidationError,
+    create_consumer,
     create_manager,
     create_portfolio,
+    delete_consumer,
+    delete_manager,
     get_portfolio,
+    list_consumers,
     list_managers,
     list_portfolios,
     list_runs,
@@ -71,7 +75,7 @@ def optimize_portfolio(
 def construct_portfolio(
     initial_cash_naira,
     risk_profile="balanced",
-    max_stocks=8,
+    max_stocks=None,
     price_file=None,
     signal_file=None,
     stale_after_hours=None,
@@ -153,7 +157,7 @@ class ConstructPortfolioRequest(BaseModel):
         "income_equity",
         "pension_equity",
     ] = "balanced_equity"
-    max_stocks: int = Field(8, ge=1, le=20)
+    max_stocks: int | None = Field(None, ge=1, le=20)
     rebalance_frequency: Literal["weekly", "monthly", "quarterly"] = "monthly"
     holding_period_days: int = Field(20, ge=1, le=252)
 
@@ -164,8 +168,17 @@ class ManagerCreateRequest(BaseModel):
     email: str = Field("", description="Optional email or internal contact")
 
 
+class ConsumerCreateRequest(BaseModel):
+    name: str = Field(..., min_length=1, description="Consumer or client name")
+    email: str = Field("", description="Optional consumer contact")
+    consumer_has_portfolio: bool = True
+
+
 class SavedPortfolioRequest(PortfolioRequest):
     name: str = Field(..., min_length=1, description="Saved portfolio name")
+    consumer_id: str = Field("", description="Optional saved consumer id")
+    consumer_name: str = Field(..., min_length=1, description="Consumer or client name")
+    consumer_email: str = Field("", description="Optional consumer contact")
     consumer_has_portfolio: bool = True
     initial_cash_naira: float | None = Field(None, ge=0)
     latest_result: Dict[str, Any] | None = None
@@ -302,6 +315,45 @@ def create_fund_manager(payload: ManagerCreateRequest) -> dict:
         raise _handle_store_error(exc) from exc
 
 
+@app.delete("/fund-managers/{manager_id}")
+def delete_fund_manager(manager_id: str) -> dict:
+    try:
+        return delete_manager(manager_id)
+    except PortfolioStoreError as exc:
+        raise _handle_store_error(exc) from exc
+
+
+@app.get("/fund-managers/{manager_id}/consumers")
+def manager_consumers(manager_id: str) -> dict:
+    try:
+        return {"consumers": list_consumers(manager_id)}
+    except PortfolioStoreError as exc:
+        raise _handle_store_error(exc) from exc
+
+
+@app.post("/fund-managers/{manager_id}/consumers")
+def create_manager_consumer(manager_id: str, payload: ConsumerCreateRequest) -> dict:
+    try:
+        return {
+            "consumer": create_consumer(
+                manager_id=manager_id,
+                name=payload.name,
+                email=payload.email,
+                consumer_has_portfolio=payload.consumer_has_portfolio,
+            )
+        }
+    except PortfolioStoreError as exc:
+        raise _handle_store_error(exc) from exc
+
+
+@app.delete("/fund-managers/{manager_id}/consumers/{consumer_id}")
+def delete_manager_consumer(manager_id: str, consumer_id: str) -> dict:
+    try:
+        return delete_consumer(manager_id, consumer_id)
+    except PortfolioStoreError as exc:
+        raise _handle_store_error(exc) from exc
+
+
 @app.get("/fund-managers/{manager_id}/portfolios")
 def manager_portfolios(manager_id: str) -> dict:
     try:
@@ -326,6 +378,9 @@ def save_manager_portfolio(manager_id: str, payload: SavedPortfolioRequest) -> d
                 holding_period_days=payload.holding_period_days,
                 consumer_has_portfolio=payload.consumer_has_portfolio,
                 initial_cash_naira=payload.initial_cash_naira,
+                consumer_id=payload.consumer_id,
+                consumer_name=payload.consumer_name,
+                consumer_email=payload.consumer_email,
                 latest_result=payload.latest_result,
             )
         }

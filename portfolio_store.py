@@ -36,7 +36,7 @@ def _path(store_file: str | Path | None = None) -> Path:
 
 
 def _empty_store() -> Dict[str, Any]:
-    return {"managers": [], "portfolios": [], "runs": []}
+    return {"managers": [], "consumers": [], "portfolios": [], "runs": []}
 
 
 def _load_store(store_file: str | Path | None = None) -> Dict[str, Any]:
@@ -49,6 +49,7 @@ def _load_store(store_file: str | Path | None = None) -> Dict[str, Any]:
         raise PortfolioStoreError(f"Portfolio store is corrupted: {path}") from exc
 
     data.setdefault("managers", [])
+    data.setdefault("consumers", [])
     data.setdefault("portfolios", [])
     data.setdefault("runs", [])
     return data
@@ -66,6 +67,10 @@ def _summary_from_result(result: Dict[str, Any] | None) -> Dict[str, Any] | None
     return {
         "generated_at": result.get("fund_manager_report", {}).get("generated_at", _now()),
         "portfolio_value": result.get("current_portfolio_value", 0),
+        "optimized_portfolio_value": result.get(
+            "optimized_portfolio_value",
+            result.get("current_portfolio_value", 0),
+        ),
         "compliance_status": result.get("compliance_report", {}).get("overall_status", "unknown"),
         "optimized_expected_return": result.get("summary_metrics", {}).get("optimized_expected_return", 0),
         "optimized_sharpe": result.get("summary_metrics", {}).get("optimized_sharpe", 0),
@@ -117,6 +122,130 @@ def get_manager(manager_id: str, store_file: str | Path | None = None) -> Dict[s
     raise PortfolioNotFoundError(f"Fund manager not found: {manager_id}")
 
 
+def delete_manager(manager_id: str, store_file: str | Path | None = None) -> Dict[str, Any]:
+    with _LOCK:
+        data = _load_store(store_file)
+        manager = next((item for item in data["managers"] if item["id"] == manager_id), None)
+        if manager is None:
+            raise PortfolioNotFoundError(f"Fund manager not found: {manager_id}")
+
+        portfolio_ids = {
+            portfolio["id"]
+            for portfolio in data["portfolios"]
+            if portfolio.get("manager_id") == manager_id
+        }
+        data["managers"] = [item for item in data["managers"] if item["id"] != manager_id]
+        data["consumers"] = [
+            consumer for consumer in data["consumers"]
+            if consumer.get("manager_id") != manager_id
+        ]
+        data["portfolios"] = [
+            portfolio for portfolio in data["portfolios"]
+            if portfolio.get("manager_id") != manager_id
+        ]
+        data["runs"] = [
+            run for run in data["runs"]
+            if run.get("manager_id") != manager_id and run.get("portfolio_id") not in portfolio_ids
+        ]
+        _save_store(data, store_file)
+        return {
+            "manager": manager,
+            "deleted_portfolios": len(portfolio_ids),
+        }
+
+
+def list_consumers(manager_id: str, store_file: str | Path | None = None) -> List[Dict[str, Any]]:
+    get_manager(manager_id, store_file)
+    with _LOCK:
+        data = _load_store(store_file)
+        consumers = [consumer for consumer in data["consumers"] if consumer["manager_id"] == manager_id]
+        portfolios = [portfolio for portfolio in data["portfolios"] if portfolio["manager_id"] == manager_id]
+        portfolio_counts: Dict[str, int] = {}
+        for portfolio in portfolios:
+            consumer_id = portfolio.get("consumer_id")
+            if consumer_id:
+                portfolio_counts[consumer_id] = portfolio_counts.get(consumer_id, 0) + 1
+
+        enriched = []
+        for consumer in consumers:
+            item = dict(consumer)
+            item["portfolio_count"] = portfolio_counts.get(consumer["id"], 0)
+            enriched.append(item)
+        return sorted(enriched, key=lambda item: item.get("updated_at", ""), reverse=True)
+
+
+def create_consumer(
+    manager_id: str,
+    name: str,
+    email: str = "",
+    consumer_has_portfolio: bool = True,
+    store_file: str | Path | None = None,
+) -> Dict[str, Any]:
+    get_manager(manager_id, store_file)
+    name = str(name or "").strip()
+    email = str(email or "").strip()
+    if not name:
+        raise PortfolioStoreValidationError("Consumer name is required.")
+
+    now = _now()
+    consumer = {
+        "id": _new_id("cons"),
+        "manager_id": manager_id,
+        "name": name,
+        "email": email,
+        "consumer_has_portfolio": bool(consumer_has_portfolio),
+        "created_at": now,
+        "updated_at": now,
+    }
+    with _LOCK:
+        data = _load_store(store_file)
+        data["consumers"].append(consumer)
+        _save_store(data, store_file)
+        return consumer
+
+
+def delete_consumer(
+    manager_id: str,
+    consumer_id: str,
+    store_file: str | Path | None = None,
+) -> Dict[str, Any]:
+    get_manager(manager_id, store_file)
+    with _LOCK:
+        data = _load_store(store_file)
+        consumer = next(
+            (
+                item for item in data["consumers"]
+                if item["id"] == consumer_id and item["manager_id"] == manager_id
+            ),
+            None,
+        )
+        if consumer is None:
+            raise PortfolioNotFoundError(f"Consumer not found: {consumer_id}")
+
+        portfolio_ids = {
+            portfolio["id"]
+            for portfolio in data["portfolios"]
+            if portfolio.get("manager_id") == manager_id and portfolio.get("consumer_id") == consumer_id
+        }
+        data["consumers"] = [
+            item for item in data["consumers"]
+            if not (item["id"] == consumer_id and item["manager_id"] == manager_id)
+        ]
+        data["portfolios"] = [
+            portfolio for portfolio in data["portfolios"]
+            if not (portfolio.get("manager_id") == manager_id and portfolio.get("consumer_id") == consumer_id)
+        ]
+        data["runs"] = [
+            run for run in data["runs"]
+            if run.get("portfolio_id") not in portfolio_ids
+        ]
+        _save_store(data, store_file)
+        return {
+            "consumer": consumer,
+            "deleted_portfolios": len(portfolio_ids),
+        }
+
+
 def list_portfolios(manager_id: str, store_file: str | Path | None = None) -> List[Dict[str, Any]]:
     get_manager(manager_id, store_file)
     with _LOCK:
@@ -137,13 +266,20 @@ def create_portfolio(
     holding_period_days: int,
     consumer_has_portfolio: bool = True,
     initial_cash_naira: float | None = None,
+    consumer_id: str = "",
+    consumer_name: str = "",
+    consumer_email: str = "",
     latest_result: Dict[str, Any] | None = None,
     store_file: str | Path | None = None,
 ) -> Dict[str, Any]:
     get_manager(manager_id, store_file)
     name = str(name or "").strip()
+    consumer_name = str(consumer_name or "").strip()
+    consumer_email = str(consumer_email or "").strip()
     if not name:
         raise PortfolioStoreValidationError("Portfolio name is required.")
+    if not consumer_name:
+        raise PortfolioStoreValidationError("Consumer name is required.")
     initial_cash = float(initial_cash_naira or 0.0)
     if consumer_has_portfolio and not holdings:
         raise PortfolioStoreValidationError("Saved portfolio must contain at least one holding.")
@@ -151,26 +287,56 @@ def create_portfolio(
         raise PortfolioStoreValidationError("Initial cash amount is required for a new consumer portfolio.")
 
     now = _now()
-    portfolio = {
-        "id": _new_id("pf"),
-        "manager_id": manager_id,
-        "name": name,
-        "consumer_has_portfolio": bool(consumer_has_portfolio),
-        "initial_cash_naira": initial_cash if not consumer_has_portfolio else None,
-        "holdings": holdings,
-        "risk_profile": risk_profile,
-        "mandate_profile": mandate_profile,
-        "allow_new_stocks": bool(allow_new_stocks),
-        "max_new_stocks": int(max_new_stocks),
-        "rebalance_frequency": rebalance_frequency,
-        "holding_period_days": int(holding_period_days),
-        "latest_result_summary": _summary_from_result(latest_result),
-        "created_at": now,
-        "updated_at": now,
-    }
-
     with _LOCK:
         data = _load_store(store_file)
+        resolved_consumer_id = str(consumer_id or "").strip()
+        if resolved_consumer_id:
+            consumer = next(
+                (
+                    item for item in data["consumers"]
+                    if item["id"] == resolved_consumer_id and item["manager_id"] == manager_id
+                ),
+                None,
+            )
+            if consumer is None:
+                raise PortfolioNotFoundError(f"Consumer not found: {resolved_consumer_id}")
+            consumer["name"] = consumer_name
+            consumer["email"] = consumer_email
+            consumer["consumer_has_portfolio"] = bool(consumer_has_portfolio)
+            consumer["updated_at"] = now
+        else:
+            consumer = {
+                "id": _new_id("cons"),
+                "manager_id": manager_id,
+                "name": consumer_name,
+                "email": consumer_email,
+                "consumer_has_portfolio": bool(consumer_has_portfolio),
+                "created_at": now,
+                "updated_at": now,
+            }
+            data["consumers"].append(consumer)
+            resolved_consumer_id = consumer["id"]
+
+        portfolio = {
+            "id": _new_id("pf"),
+            "manager_id": manager_id,
+            "consumer_id": resolved_consumer_id,
+            "name": name,
+            "consumer_has_portfolio": bool(consumer_has_portfolio),
+            "consumer_name": consumer_name,
+            "consumer_email": consumer_email,
+            "initial_cash_naira": initial_cash if not consumer_has_portfolio else None,
+            "holdings": holdings,
+            "risk_profile": risk_profile,
+            "mandate_profile": mandate_profile,
+            "allow_new_stocks": bool(allow_new_stocks),
+            "max_new_stocks": int(max_new_stocks),
+            "rebalance_frequency": rebalance_frequency,
+            "holding_period_days": int(holding_period_days),
+            "latest_result_summary": _summary_from_result(latest_result),
+            "created_at": now,
+            "updated_at": now,
+        }
         data["portfolios"].append(portfolio)
         if latest_result:
             data["runs"].append(

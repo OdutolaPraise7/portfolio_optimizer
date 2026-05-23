@@ -63,7 +63,7 @@ class ApiTests(unittest.TestCase):
         finally:
             main.get_supported_symbols = original
 
-    def test_optimize_portfolio_endpoint(self):
+    def test_optimize_portfolio_endpoint_rejects_infeasible_mandate(self):
         original = main.optimize_portfolio
 
         def patched_optimize_portfolio(**kwargs):
@@ -86,14 +86,9 @@ class ApiTests(unittest.TestCase):
                     "max_new_stocks": 1,
                 },
             )
-            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.status_code, 400)
             body = response.json()
-            self.assertIn("current_weights", body)
-            self.assertIn("optimized_allocations", body)
-            self.assertIn("summary_metrics", body)
-            self.assertIn("prediction_engine", body)
-            self.assertIn("compliance_report", body)
-            self.assertIn("fund_manager_report", body)
+            self.assertIn("Mandate infeasible", body["detail"])
         finally:
             main.optimize_portfolio = original
 
@@ -129,6 +124,7 @@ class ApiTests(unittest.TestCase):
             f"/fund-managers/{manager_id}/portfolios",
             json={
                 "name": "Balanced Equity Sleeve",
+                "consumer_name": "Chinedu Okafor",
                 "holdings": [{"symbol": "AAA", "amount_naira": 4000}],
                 "risk_profile": "balanced",
                 "mandate_profile": "balanced_equity",
@@ -139,7 +135,80 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(save_response.status_code, 200)
         portfolio = save_response.json()["portfolio"]
         self.assertEqual(portfolio["manager_id"], manager_id)
+        self.assertEqual(portfolio["consumer_name"], "Chinedu Okafor")
 
         list_response = self.client.get(f"/fund-managers/{manager_id}/portfolios")
         self.assertEqual(list_response.status_code, 200)
         self.assertEqual(len(list_response.json()["portfolios"]), 1)
+
+        delete_response = self.client.delete(f"/fund-managers/{manager_id}")
+        self.assertEqual(delete_response.status_code, 200)
+        self.assertEqual(delete_response.json()["deleted_portfolios"], 1)
+
+        list_after_delete = self.client.get(f"/fund-managers/{manager_id}/portfolios")
+        self.assertEqual(list_after_delete.status_code, 404)
+
+    def test_delete_manager_only_removes_selected_workspace(self):
+        first_response = self.client.post(
+            "/fund-managers",
+            json={"name": "Ada Manager", "firm": "Lagos Asset Co", "email": "ada@example.com"},
+        )
+        second_response = self.client.post(
+            "/fund-managers",
+            json={"name": "Bola Manager", "firm": "Abuja Capital", "email": "bola@example.com"},
+        )
+        self.assertEqual(first_response.status_code, 200)
+        self.assertEqual(second_response.status_code, 200)
+        first_id = first_response.json()["manager"]["id"]
+        second_id = second_response.json()["manager"]["id"]
+
+        delete_response = self.client.delete(f"/fund-managers/{first_id}")
+        self.assertEqual(delete_response.status_code, 200)
+
+        managers_response = self.client.get("/fund-managers")
+        self.assertEqual(managers_response.status_code, 200)
+        managers = managers_response.json()["managers"]
+        self.assertEqual([manager["id"] for manager in managers], [second_id])
+
+    def test_delete_consumer_only_removes_selected_consumer(self):
+        manager_response = self.client.post(
+            "/fund-managers",
+            json={"name": "Ada Manager", "firm": "Lagos Asset Co", "email": "ada@example.com"},
+        )
+        self.assertEqual(manager_response.status_code, 200)
+        manager_id = manager_response.json()["manager"]["id"]
+
+        consumer_response = self.client.post(
+            f"/fund-managers/{manager_id}/consumers",
+            json={"name": "Chinedu Okafor", "email": "chinedu@example.com", "consumer_has_portfolio": True},
+        )
+        self.assertEqual(consumer_response.status_code, 200)
+        consumer_id = consumer_response.json()["consumer"]["id"]
+
+        save_response = self.client.post(
+            f"/fund-managers/{manager_id}/portfolios",
+            json={
+                "name": "Chinedu Sleeve",
+                "consumer_id": consumer_id,
+                "consumer_name": "Chinedu Okafor",
+                "consumer_email": "chinedu@example.com",
+                "holdings": [{"symbol": "AAA", "amount_naira": 4000}],
+                "risk_profile": "balanced",
+                "mandate_profile": "balanced_equity",
+                "allow_new_stocks": True,
+                "max_new_stocks": 1,
+            },
+        )
+        self.assertEqual(save_response.status_code, 200)
+
+        delete_response = self.client.delete(f"/fund-managers/{manager_id}/consumers/{consumer_id}")
+        self.assertEqual(delete_response.status_code, 200)
+        self.assertEqual(delete_response.json()["deleted_portfolios"], 1)
+
+        consumers_response = self.client.get(f"/fund-managers/{manager_id}/consumers")
+        self.assertEqual(consumers_response.status_code, 200)
+        self.assertEqual(consumers_response.json()["consumers"], [])
+
+        portfolios_response = self.client.get(f"/fund-managers/{manager_id}/portfolios")
+        self.assertEqual(portfolios_response.status_code, 200)
+        self.assertEqual(portfolios_response.json()["portfolios"], [])

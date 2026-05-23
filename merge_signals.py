@@ -18,16 +18,6 @@ os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 import pandas as pd
 import numpy as np
 
-from preprocess import preprocess
-from xgb_model import xgboost_train
-from rf_model import rf_train
-from lstm_model import lstm_train, DEVICE
-from classification_models import (
-    lstm_direction_train,
-    rf_direction_train,
-    xgboost_direction_train,
-)
-
 MIN_ROWS = 500
 OUTPUT_FILE = 'signal_store.csv'
 REPORT_FILE = 'merge_signals_report.txt'
@@ -46,6 +36,8 @@ USE_CLASSIFICATION_SIGNALS = True
 MIN_MODEL_R2_FOR_VOTE = 0.0
 MIN_MODEL_DIRECTION_FOR_VOTE = 50.0
 MIN_CLASS_PROB_EDGE_FOR_VOTE = 0.05
+FALLBACK_SIGNAL_MIN_ROWS = 252
+FALLBACK_SIGNAL_MIN_TRADE_VALUE = 1_000_000
 
 
 def is_equity(symbol):
@@ -67,6 +59,8 @@ def is_equity(symbol):
 
 def load_market_data(filepath='PRICE_LIST.csv'):
     # merge_signals reads the market data once, then slices it per symbol for each model.
+    from preprocess import preprocess
+
     df = preprocess(filepath)
     symbol_cols = [col for col in df.columns if col.startswith('SYMBOL_')]
     if not symbol_cols:
@@ -203,6 +197,136 @@ def merge_results(xgb_res, rf_res, lstm_res):
     return pd.DataFrame(rows)
 
 
+def _fallback_signal_from_return(return_20d, return_60d, return_120d):
+    available = [value for value in [return_20d, return_60d, return_120d] if pd.notna(value)]
+    blended_return = float(np.mean(available) * 100.0) if available else 0.0
+    confidence = min(0.12, max(0.05, abs(blended_return) / 100.0 + 0.04))
+    if blended_return >= 2.0:
+        signal = "BUY"
+    elif blended_return <= -2.0:
+        signal = "SELL"
+    else:
+        signal = "HOLD"
+    return signal, blended_return, confidence
+
+
+def build_fallback_signal_rows(
+    price_file='PRICE_LIST.csv',
+    existing_symbols=None,
+    min_rows=None,
+    min_trade_value=None,
+):
+    existing_symbols = {str(symbol).upper() for symbol in (existing_symbols or set())}
+    min_rows = int(min_rows if min_rows is not None else get_int_env("MERGE_FALLBACK_MIN_ROWS", FALLBACK_SIGNAL_MIN_ROWS))
+    min_trade_value = float(
+        min_trade_value
+        if min_trade_value is not None
+        else os.getenv("MERGE_FALLBACK_MIN_TRADE_VALUE", FALLBACK_SIGNAL_MIN_TRADE_VALUE)
+    )
+
+    df = pd.read_csv(price_file, low_memory=False)
+    required = {"SYMBOL", "TRANS_DATE", "CLOSE_PRICE"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"{price_file} is missing required columns: {', '.join(sorted(missing))}")
+
+    df = df.copy()
+    df["SYMBOL"] = df["SYMBOL"].astype(str).str.strip().str.upper()
+    df = df[df["SYMBOL"].apply(is_equity)]
+    df = df[~df["SYMBOL"].isin(existing_symbols)]
+    df["TRANS_DATE"] = pd.to_datetime(df["TRANS_DATE"], errors="coerce")
+    df["CLOSE_PRICE"] = pd.to_numeric(df["CLOSE_PRICE"], errors="coerce")
+    if "TRADE_VALUE" in df.columns:
+        df["TRADE_VALUE"] = pd.to_numeric(df["TRADE_VALUE"], errors="coerce").fillna(0.0)
+    else:
+        df["TRADE_VALUE"] = 0.0
+    df = df.dropna(subset=["SYMBOL", "TRANS_DATE", "CLOSE_PRICE"])
+    df = df[df["CLOSE_PRICE"] > 0]
+    df = df.sort_values(["SYMBOL", "TRANS_DATE"])
+
+    rows = []
+    for symbol, group in df.groupby("SYMBOL", sort=True):
+        group = group.drop_duplicates("TRANS_DATE", keep="last").sort_values("TRANS_DATE")
+        if len(group) < min_rows:
+            continue
+
+        latest_close = float(group["CLOSE_PRICE"].iloc[-1])
+        latest_trade_value = float(group["TRADE_VALUE"].tail(20).mean())
+        if latest_trade_value < min_trade_value:
+            continue
+
+        def period_return(days):
+            if len(group) <= days:
+                return np.nan
+            start = float(group["CLOSE_PRICE"].iloc[-days - 1])
+            if start <= 0:
+                return np.nan
+            return latest_close / start - 1.0
+
+        return_20d = period_return(20)
+        return_60d = period_return(60)
+        return_120d = period_return(120)
+        signal, avg_return, confidence = _fallback_signal_from_return(return_20d, return_60d, return_120d)
+        tier = 3 if signal != "SELL" else 4
+        rows.append({
+            "Symbol": symbol,
+            "Last_Close (₦)": latest_close,
+            "XGB_Signal": None,
+            "XGB_Return (%)": None,
+            "XGB_R2": None,
+            "XGB_Direction_Acc": None,
+            "XGB_Balanced_Acc": None,
+            "XGB_Buy_Probability": None,
+            "XGB_F1_BUY": None,
+            "XGB_Confidence": None,
+            "RF_Signal": None,
+            "RF_Return (%)": None,
+            "RF_R2": None,
+            "RF_Direction_Acc": None,
+            "RF_Balanced_Acc": None,
+            "RF_Buy_Probability": None,
+            "RF_F1_BUY": None,
+            "RF_Confidence": None,
+            "LSTM_Signal": None,
+            "LSTM_Return (%)": None,
+            "LSTM_R2": None,
+            "LSTM_Direction_Acc": None,
+            "LSTM_Balanced_Acc": None,
+            "LSTM_Buy_Probability": None,
+            "LSTM_F1_BUY": None,
+            "LSTM_Confidence": None,
+            "XGB_Quality_Pass": False,
+            "RF_Quality_Pass": False,
+            "LSTM_Quality_Pass": False,
+            "Models_Run": 0,
+            "Qualified_Models": 0,
+            "Qualified_Model_Names": "",
+            "Vote_Source": "fallback_price_momentum",
+            "Consensus_Signal": signal,
+            "Consensus_Tier": tier,
+            "Avg_R2": 0.0,
+            "Avg_Quality_R2": 0.0,
+            "Avg_Confidence": round(confidence, 4),
+            "Avg_Return": round(avg_return, 4),
+            "Fallback_Return_20D (%)": round(float(return_20d * 100.0), 4) if pd.notna(return_20d) else None,
+            "Fallback_Return_60D (%)": round(float(return_60d * 100.0), 4) if pd.notna(return_60d) else None,
+            "Fallback_Return_120D (%)": round(float(return_120d * 100.0), 4) if pd.notna(return_120d) else None,
+            "Fallback_Avg_Trade_Value_20D": round(latest_trade_value, 2),
+        })
+
+    return pd.DataFrame(rows)
+
+
+def augment_signal_store_with_fallbacks(signal_df, price_file='PRICE_LIST.csv'):
+    signal_df = signal_df.copy()
+    existing_symbols = set(signal_df["Symbol"].astype(str).str.upper()) if "Symbol" in signal_df else set()
+    fallback_df = build_fallback_signal_rows(price_file, existing_symbols=existing_symbols)
+    if fallback_df.empty:
+        return signal_df, fallback_df
+    combined = pd.concat([signal_df, fallback_df], ignore_index=True, sort=False)
+    return combined.sort_values("Symbol").reset_index(drop=True), fallback_df
+
+
 def save_report(df):
     # This text report is a quick offline summary for research/debugging.
     lines = [
@@ -270,6 +394,15 @@ def save_report(df):
 
 
 def main():
+    from xgb_model import xgboost_train
+    from rf_model import rf_train
+    from lstm_model import lstm_train, DEVICE
+    from classification_models import (
+        lstm_direction_train,
+        rf_direction_train,
+        xgboost_direction_train,
+    )
+
     print("=" * 60)
     print("  MERGE SIGNALS — XGBoost + Random Forest + LSTM")
     print("=" * 60)
@@ -444,8 +577,10 @@ def main():
 
     print(f"\n{'=' * 60}")
     signal_store = merge_results(xgb_res, rf_res, lstm_res)
+    signal_store, fallback_rows = augment_signal_store_with_fallbacks(signal_store, price_file='PRICE_LIST.csv')
     signal_store.to_csv(OUTPUT_FILE, index=False)
     print(f"{OUTPUT_FILE} saved ({len(signal_store)} symbols)")
+    print(f"Fallback signal rows added: {len(fallback_rows)}")
     save_report(signal_store)
 
 

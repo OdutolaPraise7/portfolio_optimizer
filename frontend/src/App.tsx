@@ -1,8 +1,9 @@
 // App.tsx
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type {
   FundManager,
   Holding,
+  ManagedConsumer,
   MandateProfile,
   OptimizationResponse,
   OptimizedAllocation,
@@ -51,6 +52,22 @@ const stableSingleStockCap: Record<RiskProfile, number> = {
   balanced: 0.1,
   aggressive: 0.15,
 };
+
+const mandateSingleStockCap: Partial<Record<MandateProfile, number>> = {
+  growth_equity: 0.15,
+  income_equity: 0.08,
+  pension_equity: 0.07,
+};
+
+const effectiveSingleStockCap = (risk: RiskProfile, mandate: MandateProfile) =>
+  Math.min(stableSingleStockCap[risk], mandateSingleStockCap[mandate] ?? stableSingleStockCap[risk]);
+
+const minimumStocksForCap = (cap: number) => Math.ceil((1 - 1e-12) / cap);
+
+const minimumStocksForSetup = (risk: RiskProfile, mandate: MandateProfile) =>
+  minimumStocksForCap(effectiveSingleStockCap(risk, mandate));
+
+const preferredStockTarget = (minimum: number) => Math.min(20, Math.max(minimum, minimum + 3));
 
 const initialHoldings: Holding[] = [{ symbol: '', quantity: 0 }];
 
@@ -110,13 +127,14 @@ function getModelVoteSummary(a: OptimizedAllocation) {
 
 function getAllocVals(
   a: OptimizedAllocation,
-  portVal: number,
+  currentPortVal: number,
+  optimizedPortVal: number,
   prices: Record<string, number>,
   enteredShares: Record<string, number>,
 ) {
   const price = a.latest_price ?? prices[a.symbol] ?? 0;
-  const curVal = a.current_weight * portVal;
-  const optVal = a.optimized_weight * portVal;
+  const curVal = a.current_weight * currentPortVal;
+  const optVal = a.optimized_weight * optimizedPortVal;
   const curShares = enteredShares[a.symbol] ?? (price > 0 ? curVal / price : 0);
   const optShares = price > 0 ? optVal / price : 0;
   const delta = optShares - curShares;
@@ -128,6 +146,18 @@ function getTrade(delta: number) {
   if (delta > 0.01) return `Buy ${fmtShares(delta)} sh`;
   if (delta < -0.01) return `Sell ${fmtShares(Math.abs(delta))} sh`;
   return 'No trade';
+}
+
+function getOptimizedPortfolioValue(result: OptimizationResponse) {
+  if (typeof result.optimized_portfolio_value === 'number' && Number.isFinite(result.optimized_portfolio_value)) {
+    return result.optimized_portfolio_value;
+  }
+  const grossValue = result.optimized_allocations.reduce(
+    (sum, a) => sum + a.optimized_weight * result.current_portfolio_value,
+    0,
+  );
+  const baseValue = grossValue > 0 ? grossValue : result.current_portfolio_value;
+  return Math.max(baseValue - result.constraint_summary.estimated_transaction_cost_naira, 0);
 }
 
 function getComplianceBadge(status: 'pass' | 'review' | 'breach' | 'warn') {
@@ -142,9 +172,24 @@ function fmtComplianceValue(value: number | string, rule: string) {
   return fmtPct(value);
 }
 
+const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
+
+function corrCellBg(value: number) {
+  const alpha = 0.12 + clamp(Math.abs(value), 0, 1) * 0.5;
+  return value >= 0 ? `rgba(74, 222, 128, ${alpha})` : `rgba(248, 113, 113, ${alpha})`;
+}
+
 function csvEscape(v: string | number | null | undefined) {
   const t = typeof v === 'number' ? v.toString() : (v ?? '');
   return `"${String(t).replace(/"/g, '""')}"`;
+}
+
+function friendlyErrorMessage(message: string, fallback: string) {
+  if (!message) return fallback;
+  if (message.includes('Mandate infeasible')) {
+    return 'This mandate needs a broader eligible stock set. I adjusted the stock target where possible; try allowing more new stocks or choosing a less restrictive mandate.';
+  }
+  return message;
 }
 
 /* ── Clock ── */
@@ -184,6 +229,7 @@ const Icon = {
 
 /* ══════════════════════════════════════════════════════════════ */
 function App() {
+  const mainRef = useRef<HTMLElement | null>(null);
   const [symbols, setSymbols] = useState<string[]>([]);
   const [holdings, setHoldings] = useState<Holding[]>(initialHoldings);
   const [consumerPortfolioStatus, setConsumerPortfolioStatus] = useState<ConsumerPortfolioStatus>('existing');
@@ -191,7 +237,7 @@ function App() {
   const [riskProfile, setRiskProfile] = useState<RiskProfile>('balanced');
   const [mandateProfile, setMandateProfile] = useState<MandateProfile>('balanced_equity');
   const [allowNewStocks, setAllowNewStocks] = useState(true);
-  const [maxNewStocks, setMaxNewStocks] = useState(3);
+  const [maxNewStocks, setMaxNewStocks] = useState(10);
   const [rebalanceFrequency, setRebalanceFrequency] = useState<RebalanceFrequency>('monthly');
   const [holdingPeriodDays, setHoldingPeriodDays] = useState(20);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -203,14 +249,18 @@ function App() {
   const [prices, setPrices] = useState<Record<string, number>>({});
   const [signalSummary, setSignalSummary] = useState<SignalSummary | null>(null);
   const [priceUpdatedAt, setPriceUpdatedAt] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState<NavTab>('overview');
+  const [activeTab, setActiveTab] = useState<NavTab>('workspace');
   const [managers, setManagers] = useState<FundManager[]>([]);
   const [selectedManagerId, setSelectedManagerId] = useState('');
+  const [consumers, setConsumers] = useState<ManagedConsumer[]>([]);
+  const [selectedConsumerId, setSelectedConsumerId] = useState('');
   const [savedPortfolios, setSavedPortfolios] = useState<SavedPortfolio[]>([]);
   const [managerName, setManagerName] = useState('');
   const [managerFirm, setManagerFirm] = useState('');
   const [managerEmail, setManagerEmail] = useState('');
   const [portfolioName, setPortfolioName] = useState('Equity Portfolio');
+  const [consumerName, setConsumerName] = useState('');
+  const [consumerEmail, setConsumerEmail] = useState('');
   const [workspaceStatus, setWorkspaceStatus] = useState<string | null>(null);
   const [workspaceError, setWorkspaceError] = useState<string | null>(null);
 
@@ -220,6 +270,56 @@ function App() {
     [managers, selectedManagerId],
   );
   const consumerHasPortfolio = consumerPortfolioStatus === 'existing';
+  const selectedConsumer = useMemo(
+    () => consumers.find((consumer) => consumer.id === selectedConsumerId) ?? null,
+    [consumers, selectedConsumerId],
+  );
+  const activeSingleStockCap = useMemo(
+    () => effectiveSingleStockCap(riskProfile, mandateProfile),
+    [riskProfile, mandateProfile],
+  );
+  const minimumActiveStocks = useMemo(
+    () => minimumStocksForCap(activeSingleStockCap),
+    [activeSingleStockCap],
+  );
+  const currentHoldingCount = useMemo(
+    () => new Set(holdings.map((h) => h.symbol.trim().toUpperCase()).filter(Boolean)).size,
+    [holdings],
+  );
+  const minimumNewStocks = useMemo(
+    () => Math.max(0, minimumActiveStocks - currentHoldingCount),
+    [minimumActiveStocks, currentHoldingCount],
+  );
+  const minimumSliderStocks = consumerHasPortfolio ? minimumNewStocks : minimumActiveStocks;
+  const mustAllowNewStocks = consumerHasPortfolio && minimumNewStocks > 0;
+  const effectiveAllowNewStocks = !consumerHasPortfolio || allowNewStocks || mustAllowNewStocks;
+  const effectiveStockTarget = Math.min(20, Math.max(maxNewStocks, minimumSliderStocks));
+
+  const chooseRiskProfile = (profile: RiskProfile) => {
+    setRiskProfile(profile);
+    const requiredActive = minimumStocksForSetup(profile, mandateProfile);
+    const requiredNew = consumerHasPortfolio ? Math.max(0, requiredActive - currentHoldingCount) : requiredActive;
+    setMaxNewStocks(preferredStockTarget(requiredNew));
+  };
+
+  const chooseMandateProfile = (profile: MandateProfile) => {
+    setMandateProfile(profile);
+    const requiredActive = minimumStocksForSetup(riskProfile, profile);
+    const requiredNew = consumerHasPortfolio ? Math.max(0, requiredActive - currentHoldingCount) : requiredActive;
+    setMaxNewStocks(preferredStockTarget(requiredNew));
+  };
+
+  const updateStockTarget = (value: number) => {
+    setMaxNewStocks(Math.max(minimumSliderStocks, value));
+  };
+
+  useEffect(() => {
+    setMaxNewStocks((current) => Math.max(current, preferredStockTarget(minimumSliderStocks)));
+  }, [minimumSliderStocks]);
+
+  useEffect(() => {
+    if (mustAllowNewStocks) setAllowNewStocks(true);
+  }, [mustAllowNewStocks]);
 
   useEffect(() => {
     (async () => {
@@ -247,16 +347,28 @@ function App() {
   useEffect(() => {
     if (!selectedManagerId) {
       setSavedPortfolios([]);
+      setConsumers([]);
+      setSelectedConsumerId('');
       return;
     }
     (async () => {
       try {
-        const res = await fetch(`${API_BASE_URL}/fund-managers/${selectedManagerId}/portfolios`, { cache: 'no-store' });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail ?? 'Could not load saved portfolios.');
-        setSavedPortfolios(data.portfolios ?? []);
+        const [portfolioRes, consumerRes] = await Promise.all([
+          fetch(`${API_BASE_URL}/fund-managers/${selectedManagerId}/portfolios`, { cache: 'no-store' }),
+          fetch(`${API_BASE_URL}/fund-managers/${selectedManagerId}/consumers`, { cache: 'no-store' }),
+        ]);
+        const portfolioData = await portfolioRes.json();
+        const consumerData = await consumerRes.json();
+        if (!portfolioRes.ok) throw new Error(portfolioData.detail ?? 'Could not load saved portfolios.');
+        if (!consumerRes.ok) throw new Error(consumerData.detail ?? 'Could not load managed consumers.');
+        const loadedConsumers: ManagedConsumer[] = consumerData.consumers ?? [];
+        setSavedPortfolios(portfolioData.portfolios ?? []);
+        setConsumers(loadedConsumers);
+        setSelectedConsumerId((current) => (
+          loadedConsumers.some((consumer) => consumer.id === current) ? current : ''
+        ));
       } catch (e) {
-        setWorkspaceError(e instanceof Error ? e.message : 'Could not load saved portfolios.');
+        setWorkspaceError(e instanceof Error ? e.message : 'Could not load workspace data.');
       }
     })();
   }, [selectedManagerId]);
@@ -267,6 +379,11 @@ function App() {
       : initialCashNaira,
     [consumerHasPortfolio, holdings, initialCashNaira, prices],
   );
+
+  const currentPortfolioValue = result?.current_portfolio_value ?? totalBudget;
+  const optimizedPortfolioValue = result ? getOptimizedPortfolioValue(result) : totalBudget;
+  const displayedPortfolioValue = result ? optimizedPortfolioValue : totalBudget;
+  const valueDelta = optimizedPortfolioValue - currentPortfolioValue;
 
   const enteredShares = useMemo(
     () => holdings.reduce((m, h) => {
@@ -331,8 +448,8 @@ function App() {
             holdings: buildHoldingPayload(),
             risk_profile: riskProfile,
             mandate_profile: mandateProfile,
-            allow_new_stocks: allowNewStocks,
-            max_new_stocks: maxNewStocks,
+            allow_new_stocks: effectiveAllowNewStocks,
+            max_new_stocks: effectiveStockTarget,
             rebalance_frequency: rebalanceFrequency,
             holding_period_days: holdingPeriodDays,
           }
@@ -340,7 +457,7 @@ function App() {
             initial_cash_naira: initialCashNaira,
             risk_profile: riskProfile,
             mandate_profile: mandateProfile,
-            max_stocks: Math.max(1, maxNewStocks),
+            max_stocks: Math.max(1, effectiveStockTarget),
             rebalance_frequency: rebalanceFrequency,
             holding_period_days: holdingPeriodDays,
           };
@@ -353,7 +470,8 @@ function App() {
       if (!res.ok) throw new Error(data.detail ?? (consumerHasPortfolio ? 'Optimization failed.' : 'Portfolio construction failed.'));
       setResult(data); setActiveTab('dashboard'); setStatusMessage(consumerHasPortfolio ? 'Optimization complete.' : 'Portfolio constructed.');
     } catch (e) {
-      setError(e instanceof Error ? e.message : (consumerHasPortfolio ? 'Optimization failed.' : 'Portfolio construction failed.'));
+      const fallback = consumerHasPortfolio ? 'Optimization failed.' : 'Portfolio construction failed.';
+      setError(friendlyErrorMessage(e instanceof Error ? e.message : '', fallback));
       setStatusMessage(null); setResult(null);
     } finally {
       setIsSubmitting(false);
@@ -372,6 +490,14 @@ function App() {
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail ?? 'Could not refresh saved portfolios.');
     setSavedPortfolios(data.portfolios ?? []);
+  };
+
+  const refreshConsumers = async (managerId = selectedManagerId) => {
+    if (!managerId) return;
+    const res = await fetch(`${API_BASE_URL}/fund-managers/${managerId}/consumers`, { cache: 'no-store' });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail ?? 'Could not refresh managed consumers.');
+    setConsumers(data.consumers ?? []);
   };
 
   const createManagerAccount = async () => {
@@ -394,10 +520,161 @@ function App() {
     }
   };
 
+  const selectWorkspace = (managerId: string) => {
+    setSelectedManagerId(managerId);
+    setSelectedConsumerId('');
+    setConsumerName('');
+    setConsumerEmail('');
+    setWorkspaceError(null);
+    setWorkspaceStatus(managerId ? 'Workspace activated.' : null);
+  };
+
+  const selectConsumer = (consumerId: string) => {
+    setSelectedConsumerId(consumerId);
+    const consumer = consumers.find((item) => item.id === consumerId);
+    if (consumer) {
+      setConsumerName(consumer.name);
+      setConsumerEmail(consumer.email ?? '');
+      setConsumerPortfolioStatus(consumer.consumer_has_portfolio ? 'existing' : 'new');
+      setWorkspaceStatus('Consumer selected.');
+    } else {
+      setConsumerName('');
+      setConsumerEmail('');
+      setWorkspaceStatus(null);
+    }
+    setWorkspaceError(null);
+  };
+
+  const registerConsumer = async () => {
+    setWorkspaceError(null); setWorkspaceStatus(null);
+    if (!selectedManagerId) {
+      setWorkspaceError('Select a manager workspace before adding a consumer.');
+      return;
+    }
+    if (!consumerName.trim()) {
+      setWorkspaceError('Enter the consumer name before adding.');
+      return;
+    }
+    try {
+      const res = await fetch(`${API_BASE_URL}/fund-managers/${selectedManagerId}/consumers`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: consumerName,
+          email: consumerEmail,
+          consumer_has_portfolio: consumerHasPortfolio,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail ?? 'Could not add consumer.');
+      const consumer: ManagedConsumer = data.consumer;
+      setConsumers((current) => [consumer, ...current]);
+      setSelectedConsumerId(consumer.id);
+      setConsumerName(consumer.name);
+      setConsumerEmail(consumer.email ?? '');
+      setConsumerPortfolioStatus(consumer.consumer_has_portfolio ? 'existing' : 'new');
+      setWorkspaceStatus(`Added ${consumer.name}.`);
+    } catch (e) {
+      setWorkspaceError(e instanceof Error ? e.message : 'Could not add consumer.');
+    }
+  };
+
+  const startNewConsumer = () => {
+    setSelectedConsumerId('');
+    setConsumerName('');
+    setConsumerEmail('');
+    setConsumerPortfolioStatus('existing');
+    setWorkspaceStatus('Ready for a new consumer.');
+    setWorkspaceError(null);
+  };
+
+  const exitConsumer = () => {
+    setSelectedConsumerId('');
+    setConsumerName('');
+    setConsumerEmail('');
+    setWorkspaceStatus('Exited active consumer.');
+    setWorkspaceError(null);
+  };
+
+  const deleteActiveConsumer = async () => {
+    if (!selectedManagerId) {
+      setWorkspaceError('Select a manager workspace before deleting a consumer.');
+      return;
+    }
+    if (!selectedConsumer) {
+      setWorkspaceError('Select a consumer before deleting.');
+      return;
+    }
+    const confirmed = window.confirm(
+      `Delete only ${selectedConsumer.name}'s consumer profile and saved portfolios? Other consumers will remain.`,
+    );
+    if (!confirmed) return;
+
+    setWorkspaceError(null); setWorkspaceStatus(null);
+    try {
+      const res = await fetch(
+        `${API_BASE_URL}/fund-managers/${selectedManagerId}/consumers/${selectedConsumer.id}`,
+        { method: 'DELETE' },
+      );
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail ?? 'Could not delete consumer.');
+      setSelectedConsumerId('');
+      setConsumerName('');
+      setConsumerEmail('');
+      await refreshConsumers(selectedManagerId);
+      await refreshPortfolios(selectedManagerId);
+      setWorkspaceStatus(`Deleted ${data.consumer?.name ?? selectedConsumer.name}.`);
+    } catch (e) {
+      setWorkspaceError(e instanceof Error ? e.message : 'Could not delete consumer.');
+    }
+  };
+
+  const exitWorkspace = () => {
+    setSelectedManagerId('');
+    setSelectedConsumerId('');
+    setSavedPortfolios([]);
+    setConsumerName('');
+    setConsumerEmail('');
+    setWorkspaceError(null);
+    setWorkspaceStatus('Exited active workspace.');
+  };
+
+  const deleteActiveWorkspace = async () => {
+    if (!selectedManager) {
+      setWorkspaceError('Select a workspace before deleting.');
+      return;
+    }
+    const confirmed = window.confirm(
+      `Delete only ${selectedManager.name}'s selected workspace and its saved portfolios? Other workspaces will remain.`,
+    );
+    if (!confirmed) return;
+
+    setWorkspaceError(null); setWorkspaceStatus(null);
+    try {
+      const res = await fetch(`${API_BASE_URL}/fund-managers/${selectedManager.id}`, { method: 'DELETE' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail ?? 'Could not delete workspace.');
+      setManagers((current) => current.filter((manager) => manager.id !== selectedManager.id));
+      setSelectedManagerId('');
+      setSelectedConsumerId('');
+      setSavedPortfolios([]);
+      setConsumers([]);
+      setConsumerName('');
+      setConsumerEmail('');
+      setWorkspaceStatus(`Deleted ${data.manager?.name ?? selectedManager.name}'s workspace.`);
+    } catch (e) {
+      setWorkspaceError(e instanceof Error ? e.message : 'Could not delete workspace.');
+    }
+  };
+
   const saveCurrentPortfolio = async () => {
     setWorkspaceError(null); setWorkspaceStatus(null);
     if (!selectedManagerId) {
       setWorkspaceError('Create or select a fund manager workspace first.');
+      return;
+    }
+    if (!consumerName.trim()) {
+      setWorkspaceError('Enter the consumer name before saving.');
       return;
     }
     if (!validateForm()) {
@@ -410,11 +687,14 @@ function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           name: portfolioName,
+          consumer_id: selectedConsumerId,
+          consumer_name: consumerName,
+          consumer_email: consumerEmail,
           holdings: buildHoldingPayload(),
           risk_profile: riskProfile,
           mandate_profile: mandateProfile,
-          allow_new_stocks: consumerHasPortfolio ? allowNewStocks : true,
-          max_new_stocks: Math.max(1, maxNewStocks),
+          allow_new_stocks: effectiveAllowNewStocks,
+          max_new_stocks: Math.max(1, effectiveStockTarget),
           rebalance_frequency: rebalanceFrequency,
           holding_period_days: holdingPeriodDays,
           consumer_has_portfolio: consumerHasPortfolio,
@@ -425,6 +705,8 @@ function App() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail ?? 'Could not save portfolio.');
       await refreshPortfolios(selectedManagerId);
+      await refreshConsumers(selectedManagerId);
+      if (data.portfolio?.consumer_id) setSelectedConsumerId(data.portfolio.consumer_id);
       setWorkspaceStatus(`Saved ${data.portfolio.name}.`);
       setActiveTab('workspace');
     } catch (e) {
@@ -448,10 +730,13 @@ function App() {
     setRiskProfile(portfolio.risk_profile);
     setMandateProfile(portfolio.mandate_profile);
     setAllowNewStocks(portfolio.allow_new_stocks);
-    setMaxNewStocks(portfolio.max_new_stocks);
+    setMaxNewStocks(Math.min(20, portfolio.max_new_stocks));
     setRebalanceFrequency(portfolio.rebalance_frequency);
     setHoldingPeriodDays(portfolio.holding_period_days);
     setPortfolioName(portfolio.name);
+    setSelectedConsumerId(portfolio.consumer_id ?? '');
+    setConsumerName(portfolio.consumer_name ?? '');
+    setConsumerEmail(portfolio.consumer_email ?? '');
     setActiveTab('input');
     setWorkspaceStatus(`Loaded ${portfolio.name}.`);
   };
@@ -467,7 +752,7 @@ function App() {
       setWorkspaceStatus(`Optimization recorded for ${portfolio.name}.`);
       setActiveTab('dashboard');
     } catch (e) {
-      setWorkspaceError(e instanceof Error ? e.message : 'Could not optimize saved portfolio.');
+      setWorkspaceError(friendlyErrorMessage(e instanceof Error ? e.message : '', 'Could not optimize saved portfolio.'));
       setWorkspaceStatus(null);
     }
   };
@@ -483,6 +768,9 @@ function App() {
       ['Generated At', result.fund_manager_report.generated_at],
       ['Recommendation', result.fund_manager_report.recommendation],
       ['Compliance Status', result.compliance_report.overall_status],
+      ['Current Portfolio Value', result.current_portfolio_value],
+      ['Net Post-Trade Value', optimizedPortfolioValue],
+      ['Estimated Transaction Cost', result.constraint_summary.estimated_transaction_cost_naira],
       [],
       ['Prediction Engine'],
       ['Models', result.prediction_engine.models.join(' + ')],
@@ -498,7 +786,7 @@ function App() {
       ['Optimized Allocation'],
       ['Symbol', 'Sector', 'Signal', 'Model Votes', 'Tier', 'Confidence', 'Exp Return', 'Cur Shares', 'Cur Value', 'Opt Shares', 'Opt Value', 'Trade', 'Trade Value', 'Action', 'Reason'],
       ...result.optimized_allocations.map((a) => {
-        const v = getAllocVals(a, result.current_portfolio_value, prices, enteredShares);
+        const v = getAllocVals(a, result.current_portfolio_value, optimizedPortfolioValue, prices, enteredShares);
         return [a.symbol, a.sector, a.signal_status, getModelVoteSummary(a), a.consensus_tier?.toString() ?? '', a.avg_confidence?.toString() ?? '', a.expected_return.toString(), v.curShares.toString(), v.curVal.toString(), v.optShares.toString(), v.optVal.toString(), getTrade(v.delta), v.tradeVal.toString(), a.action, getChangeReason(a)];
       }),
     ];
@@ -511,15 +799,20 @@ function App() {
 
   /* ── Nav config ── */
   const navItems: { id: NavTab; label: string; icon: () => JSX.Element; badge?: string }[] = [
-    { id: 'overview',   label: 'Overview',   icon: Icon.grid },
     { id: 'watchlist',  label: 'Watchlist',  icon: Icon.signal, badge: signalSummary ? `${signalSummary.buy_count}` : undefined },
+    { id: 'workspace',  label: 'Workspace',  icon: Icon.user,   badge: savedPortfolios.length ? `${savedPortfolios.length}` : undefined },
     { id: 'input',      label: 'Input',      icon: Icon.sliders },
     { id: 'dashboard',  label: 'Dashboard',  icon: Icon.chart,  badge: result ? 'RDY' : undefined },
-    { id: 'workspace',  label: 'Workspace',  icon: Icon.user,   badge: savedPortfolios.length ? `${savedPortfolios.length}` : undefined },
     { id: 'data',       label: 'Data',       icon: Icon.db },
+    { id: 'overview',   label: 'Overview',   icon: Icon.grid },
   ];
 
   const activeLabel = navItems.find((n) => n.id === activeTab)?.label ?? '';
+
+  useEffect(() => {
+    mainRef.current?.scrollTo({ top: 0, left: 0, behavior: 'auto' });
+    window.scrollTo({ top: 0, left: 0, behavior: 'auto' });
+  }, [activeTab, result]);
 
   /* ────────────────────────────────────────────────────────────── */
   return (
@@ -571,8 +864,8 @@ function App() {
             <strong>{signalSummary ? fmtPct(signalSummary.avg_confidence, 0) : '—'}</strong>
           </div>
           <div className="sidebar-stat">
-            <span>Portfolio value</span>
-            <strong>{totalBudget > 0 ? fmtCcy(totalBudget) : '—'}</strong>
+            <span>{result ? 'Net post-trade value' : 'Portfolio value'}</span>
+            <strong>{displayedPortfolioValue > 0 ? fmtCcy(displayedPortfolioValue) : '—'}</strong>
           </div>
         </div>
       </aside>
@@ -593,7 +886,7 @@ function App() {
       </header>
 
       {/* ── MAIN ── */}
-      <main className="main">
+      <main className="main" ref={mainRef}>
 
         {/* ══ OVERVIEW ══ */}
         {activeTab === 'overview' && (
@@ -601,9 +894,11 @@ function App() {
             {/* KPI strip */}
             <div className="metric-strip">
               <div className="metric-card">
-                <div className="metric-label">Portfolio Value</div>
-                <div className="metric-value">{totalBudget > 0 ? fmtCcy(totalBudget) : '—'}</div>
-                <div className="metric-sub">{holdings.length} holding{holdings.length === 1 ? '' : 's'} entered</div>
+                <div className="metric-label">{result ? 'Net Post-Trade Value' : 'Portfolio Value'}</div>
+                <div className="metric-value">{displayedPortfolioValue > 0 ? fmtCcy(displayedPortfolioValue) : '—'}</div>
+                <div className="metric-sub">
+                  {result ? `Before ${fmtCcy(currentPortfolioValue)}` : `${holdings.length} holding${holdings.length === 1 ? '' : 's'} entered`}
+                </div>
               </div>
               <div className="metric-card">
                 <div className="metric-label">Signal Universe</div>
@@ -723,6 +1018,50 @@ function App() {
 
         {/* ══ INPUT ══ */}
         {activeTab === 'input' && (
+          <>
+            <div className="panel">
+              <div className="panel-head">
+                <div className="panel-title">Active Workspace Identity</div>
+                <button className="btn btn-ghost" style={{ fontSize: '10.5px', padding: '0.3rem 0.7rem' }} onClick={() => setActiveTab('workspace')}>
+                  Change Workspace
+                </button>
+              </div>
+              <div className="panel-body">
+                <div className="grid-3">
+                  <div className="field-readonly">
+                    <div className="field-label">Manager</div>
+                    <div className="field-readonly-val">{selectedManager ? selectedManager.name : 'No active manager'}</div>
+                    <div className="metric-sub">{selectedManager ? selectedManager.firm : 'Select or create a workspace first'}</div>
+                  </div>
+                  <div className="form-field">
+                    <div className="field-label">Managed consumer</div>
+                    <select className="field-input" value={selectedConsumerId} onChange={(e) => selectConsumer(e.target.value)} disabled={!selectedManagerId || consumers.length === 0}>
+                      <option value="">{consumers.length ? 'Select consumer' : 'No consumers registered'}</option>
+                      {consumers.map((consumer) => (
+                        <option key={consumer.id} value={consumer.id}>
+                          {consumer.name} — {consumer.consumer_has_portfolio ? 'has portfolio' : 'new portfolio'}
+                        </option>
+                      ))}
+                    </select>
+                    {selectedConsumer && (
+                      <div className="workspace-actions" style={{ marginTop: '0.45rem' }}>
+                        <button className="btn btn-ghost" style={{ fontSize: '10.5px', padding: '0.3rem 0.7rem' }} onClick={exitConsumer}>Exit Consumer</button>
+                        <button className="btn btn-danger" style={{ fontSize: '10.5px', padding: '0.3rem 0.7rem' }} onClick={deleteActiveConsumer}>Delete Consumer</button>
+                      </div>
+                    )}
+                  </div>
+                  <div className="form-field">
+                    <div className="field-label">Consumer name</div>
+                    <input className="field-input" value={consumerName} onChange={(e) => setConsumerName(e.target.value)} placeholder="Consumer or client name" />
+                  </div>
+                  <div className="form-field">
+                    <div className="field-label">Consumer contact</div>
+                    <input className="field-input" value={consumerEmail} onChange={(e) => setConsumerEmail(e.target.value)} placeholder="optional email or phone" />
+                  </div>
+                </div>
+              </div>
+            </div>
+
           <div className="grid-form">
             {/* Left — holdings */}
             <div className="panel">
@@ -827,14 +1166,14 @@ function App() {
                 <div className="panel-body">
                   <div className="risk-row">
                     {(['conservative', 'balanced', 'aggressive'] as RiskProfile[]).map((p) => (
-                      <button key={p} className={`risk-pill ${p === riskProfile ? 'active' : ''}`} onClick={() => setRiskProfile(p)}>{p}</button>
+                      <button key={p} className={`risk-pill ${p === riskProfile ? 'active' : ''}`} onClick={() => chooseRiskProfile(p)}>{p}</button>
                     ))}
                   </div>
                   <div style={{ marginTop: '0.6rem', fontSize: '11px', color: 'var(--text-3)', lineHeight: 1.5 }}>
                     {riskDescriptions[riskProfile]}
                   </div>
                   <div style={{ marginTop: '0.75rem' }}>
-                    <div className="summary-row"><span>Single-stock cap</span><strong>{fmtPct(stableSingleStockCap[riskProfile], 0)}</strong></div>
+                    <div className="summary-row"><span>Single-stock cap</span><strong>{fmtPct(activeSingleStockCap, 0)}</strong></div>
                   </div>
                 </div>
               </div>
@@ -849,7 +1188,7 @@ function App() {
                       <button
                         key={p}
                         className={`mandate-tile ${p === mandateProfile ? 'active' : ''}`}
-                        onClick={() => setMandateProfile(p)}
+                        onClick={() => chooseMandateProfile(p)}
                       >
                         <strong>{mandateLabels[p]}</strong>
                         <span>{mandateDescriptions[p]}</span>
@@ -865,13 +1204,24 @@ function App() {
                 </div>
                 <div className="panel-body" style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
                   <label className="toggle-row">
-                    <input type="checkbox" checked={consumerHasPortfolio ? allowNewStocks : true} onChange={(e) => setAllowNewStocks(e.target.checked)} disabled={!consumerHasPortfolio} />
-                    <span>{consumerHasPortfolio ? 'Allow optimizer to introduce new signal names' : 'Build from signal-approved names'}</span>
+                    <input type="checkbox" checked={effectiveAllowNewStocks} onChange={(e) => setAllowNewStocks(e.target.checked)} disabled={!consumerHasPortfolio || mustAllowNewStocks} />
+                    <span>
+                      {mustAllowNewStocks
+                        ? 'New signal names required to satisfy this mandate'
+                        : consumerHasPortfolio ? 'Allow optimizer to introduce new signal names' : 'Build from signal-approved names'}
+                    </span>
                   </label>
 
                   <div className="form-field">
-                    <div className="field-label">{consumerHasPortfolio ? 'Max new stocks' : 'Target stocks'} — {maxNewStocks}</div>
-                    <input type="range" min={consumerHasPortfolio ? '0' : '1'} max="10" value={maxNewStocks} onChange={(e) => setMaxNewStocks(Number(e.target.value))} disabled={consumerHasPortfolio && !allowNewStocks} style={{ width: '100%', accentColor: 'var(--accent)' }} />
+                    <div className="field-label">{consumerHasPortfolio ? 'Max new stocks' : 'Target stocks'} — {effectiveStockTarget}</div>
+                    <input type="range" min={String(minimumSliderStocks)} max="20" value={effectiveStockTarget} onChange={(e) => updateStockTarget(Number(e.target.value))} disabled={consumerHasPortfolio && !effectiveAllowNewStocks} style={{ width: '100%', accentColor: 'var(--accent)' }} />
+                  </div>
+                  <div className="field-readonly">
+                    <div className="field-label">{consumerHasPortfolio ? 'Minimum new stocks for this setup' : 'Minimum active stocks for this setup'}</div>
+                    <div className="field-readonly-val">{consumerHasPortfolio ? minimumNewStocks : minimumActiveStocks}</div>
+                    <div className="metric-sub">
+                      {fmtPct(activeSingleStockCap, 0)} max per stock means the portfolio needs at least {minimumActiveStocks} active stocks. {consumerHasPortfolio ? `${currentHoldingCount} current holding${currentHoldingCount === 1 ? '' : 's'} entered, so at least ${minimumNewStocks} new stock${minimumNewStocks === 1 ? '' : 's'} may be needed.` : 'The target starts at that minimum to avoid concentration breaches.'}
+                    </div>
                   </div>
 
                   <div className="form-field">
@@ -889,7 +1239,7 @@ function App() {
                   </div>
 
                   <button className="btn btn-primary btn-full" onClick={submitPortfolio} disabled={isSubmitting}>
-                    {isSubmitting ? (consumerHasPortfolio ? 'OPTIMIZING…' : 'CONSTRUCTING…') : (consumerHasPortfolio ? '▶  RUN OPTIMIZER' : '▶  CONSTRUCT PORTFOLIO')}
+                    {isSubmitting ? (consumerHasPortfolio ? 'OPTIMIZING…' : 'CONSTRUCTING…') : (consumerHasPortfolio ? '▶  RUN OPTIMIZER' : '▶  CONSTRUCT FIRST PORTFOLIO')}
                   </button>
                   <button className="btn btn-ghost btn-full" onClick={saveCurrentPortfolio} disabled={isSubmitting}>
                     Save to Workspace
@@ -906,12 +1256,33 @@ function App() {
               </div>
             </div>
           </div>
+          </>
         )}
 
         {/* ══ DASHBOARD ══ */}
         {activeTab === 'dashboard' && (
           result ? (
             <>
+              <div className="metric-strip" style={{ gridTemplateColumns: 'repeat(3, 1fr)' }}>
+                <div className="metric-card">
+                  <div className="metric-label">Current Portfolio Value</div>
+                  <div className="metric-value" style={{ fontSize: '1.25rem' }}>{fmtCcy(currentPortfolioValue)}</div>
+                  <div className="metric-sub">Value before recommended trades</div>
+                </div>
+                <div className="metric-card">
+                  <div className="metric-label">Net Post-Trade Value</div>
+                  <div className="metric-value up" style={{ fontSize: '1.25rem' }}>{fmtCcy(optimizedPortfolioValue)}</div>
+                  <div className="metric-sub">Same capital after estimated transaction costs</div>
+                </div>
+                <div className="metric-card">
+                  <div className="metric-label">Trading Cost Impact</div>
+                  <div className={`metric-value ${valueDelta < 0 ? 'down' : valueDelta > 0 ? 'up' : ''}`} style={{ fontSize: '1.25rem' }}>
+                    {fmtCcySigned(valueDelta)}
+                  </div>
+                  <div className="metric-sub">Cost estimate {fmtCcy(result.constraint_summary.estimated_transaction_cost_naira)}</div>
+                </div>
+              </div>
+
               {/* KPI strip */}
               <div className="metric-strip" style={{ gridTemplateColumns: 'repeat(5, 1fr)' }}>
                 {[
@@ -949,6 +1320,170 @@ function App() {
                     </div>
                   </div>
                 ))}
+              </div>
+
+              <div className="grid-2">
+                <div className="panel">
+                  <div className="panel-head">
+                    <div className="panel-title">Efficient Frontier</div>
+                    <span className="badge badge-blue">Risk vs return</span>
+                  </div>
+                  <div className="analytics-body">
+                    {(() => {
+                      const frontier = result.efficient_frontier;
+                      const points = frontier.points.length ? frontier.points : [frontier.optimized];
+                      const markers = [
+                        { label: 'Current', point: frontier.current, cls: 'frontier-current' },
+                        { label: 'Optimized', point: frontier.optimized, cls: 'frontier-optimized' },
+                        { label: 'Benchmark', point: frontier.benchmark, cls: 'frontier-benchmark' },
+                      ];
+                      const allPoints = [...points, ...markers.map((m) => m.point)];
+                      const minVol = Math.min(...allPoints.map((p) => p.volatility));
+                      const maxVol = Math.max(...allPoints.map((p) => p.volatility));
+                      const minRet = Math.min(...allPoints.map((p) => p.expected_return));
+                      const maxRet = Math.max(...allPoints.map((p) => p.expected_return));
+                      const volPad = Math.max((maxVol - minVol) * 0.12, 0.01);
+                      const retPad = Math.max((maxRet - minRet) * 0.12, 0.01);
+                      const volLo = Math.max(0, minVol - volPad);
+                      const volHi = maxVol + volPad;
+                      const retLo = minRet - retPad;
+                      const retHi = maxRet + retPad;
+                      const plot = { left: 52, right: 332, top: 24, bottom: 192 };
+                      const chartWidth = plot.right - plot.left;
+                      const chartHeight = plot.bottom - plot.top;
+                      const x = (vol: number) => plot.left + ((vol - volLo) / Math.max(volHi - volLo, 0.000001)) * chartWidth;
+                      const y = (ret: number) => plot.bottom - ((ret - retLo) / Math.max(retHi - retLo, 0.000001)) * chartHeight;
+                      const xTicks = [volLo, (volLo + volHi) / 2, volHi];
+                      const yTicks = [retLo, (retLo + retHi) / 2, retHi];
+                      const path = points.map((p, i) => `${i === 0 ? 'M' : 'L'} ${x(p.volatility).toFixed(1)} ${y(p.expected_return).toFixed(1)}`).join(' ');
+                      return (
+                        <>
+                          <svg className="frontier-chart" viewBox="0 0 360 235" role="img" aria-label="Efficient frontier chart">
+                            {xTicks.map((tick) => (
+                              <g key={`x-${tick}`}>
+                                <line x1={x(tick)} y1={plot.top} x2={x(tick)} y2={plot.bottom} className="chart-grid" />
+                                <text x={x(tick)} y="211" className="chart-tick" textAnchor="middle">{fmtPct(tick, 0)}</text>
+                              </g>
+                            ))}
+                            {yTicks.map((tick) => (
+                              <g key={`y-${tick}`}>
+                                <line x1={plot.left} y1={y(tick)} x2={plot.right} y2={y(tick)} className="chart-grid" />
+                                <text x="44" y={y(tick) + 3} className="chart-tick" textAnchor="end">{fmtPct(tick, 0)}</text>
+                              </g>
+                            ))}
+                            <line x1={plot.left} y1={plot.bottom} x2={plot.right} y2={plot.bottom} className="chart-axis" />
+                            <line x1={plot.left} y1={plot.bottom} x2={plot.left} y2={plot.top} className="chart-axis" />
+                            <path d={path} className="frontier-line" />
+                            {points.map((p, i) => (
+                              <circle key={`frontier-${i}`} cx={x(p.volatility)} cy={y(p.expected_return)} r="2.2" className="frontier-dot" />
+                            ))}
+                            {markers.map((m) => {
+                              const cx = x(m.point.volatility);
+                              const cy = y(m.point.expected_return);
+                              const labelAnchor = cx > 255 ? 'end' : 'start';
+                              const labelX = cx > 255 ? cx - 7 : cx + 7;
+                              return (
+                                <g key={m.label}>
+                                  <circle cx={cx} cy={cy} r="5.2" className={m.cls} />
+                                  <text x={labelX} y={cy - 7} className="frontier-label" textAnchor={labelAnchor}>{m.label}</text>
+                                  <title>{`${m.label}: return ${fmtPct(m.point.expected_return)}, volatility ${fmtPct(m.point.volatility)}, Sharpe ${m.point.sharpe.toFixed(3)}`}</title>
+                                </g>
+                              );
+                            })}
+                            <text x="192" y="229" className="chart-axis-label" textAnchor="middle">Volatility / Risk</text>
+                            <text x="13" y="108" className="chart-axis-label" textAnchor="middle" transform="rotate(-90 13 108)">Expected Return</text>
+                          </svg>
+                          <div className="frontier-summary">
+                            <div><span>Optimized Return</span><strong>{fmtPct(frontier.optimized.expected_return)}</strong></div>
+                            <div><span>Optimized Risk</span><strong>{fmtPct(frontier.optimized.volatility)}</strong></div>
+                            <div><span>Sharpe</span><strong>{frontier.optimized.sharpe.toFixed(3)}</strong></div>
+                          </div>
+                          <div className="frontier-legend">
+                            {markers.map((m) => (
+                              <span key={m.label}><i className={m.cls} />{m.label}</span>
+                            ))}
+                          </div>
+                          <div className="analytics-note">X-axis is volatility. Y-axis is expected return. The optimized point is the selected risk-adjusted portfolio.</div>
+                        </>
+                      );
+                    })()}
+                  </div>
+                </div>
+
+                <div className="panel">
+                  <div className="panel-head">
+                    <div className="panel-title">Diversification Score</div>
+                    <span className={`badge ${result.diversification_score.score >= 75 ? 'badge-buy' : result.diversification_score.score >= 55 ? 'badge-hold' : 'badge-sell'}`}>
+                      {result.diversification_score.score}/100
+                    </span>
+                  </div>
+                  <div className="analytics-body">
+                    <div className="score-ring" style={{ background: `conic-gradient(var(--green-400) ${result.diversification_score.score * 3.6}deg, rgba(255,255,255,0.08) 0deg)` }}>
+                      <div>{result.diversification_score.score}</div>
+                    </div>
+                    <div className="analytics-note">{result.diversification_score.message}</div>
+                    <div className="panel-body-sm" style={{ padding: 0 }}>
+                      <div className="stat-pair"><span>Effective positions</span><strong>{result.diversification_score.effective_positions} / {result.diversification_score.active_positions}</strong></div>
+                      <div className="stat-pair"><span>Effective sectors</span><strong>{result.diversification_score.effective_sectors} / {result.diversification_score.sector_count}</strong></div>
+                      <div className="stat-pair"><span>Largest stock</span><strong>{fmtPct(result.diversification_score.largest_weight)}</strong></div>
+                      <div className="stat-pair"><span>Largest sector</span><strong>{fmtPct(result.diversification_score.largest_sector_weight)}</strong></div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="grid-2">
+                <div className="panel">
+                  <div className="panel-head">
+                    <div className="panel-title">Risk Contribution</div>
+                    <span className="badge badge-blue">Top drivers</span>
+                  </div>
+                  <div className="analytics-body">
+                    {result.risk_contributions.slice(0, 8).map((row) => (
+                      <div className="risk-row-item" key={row.symbol}>
+                        <div className="risk-row-head">
+                          <strong>{row.symbol}</strong>
+                          <span>{fmtPct(row.risk_contribution_pct)} risk · {fmtPct(row.weight)} weight</span>
+                        </div>
+                        <div className="bar-track">
+                          <div className="bar-fill-after" style={{ width: `${clamp(row.risk_contribution_pct * 100, 2, 100)}%` }} />
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="panel">
+                  <div className="panel-head">
+                    <div className="panel-title">Correlation Heatmap</div>
+                    <span className="badge badge-blue">{result.correlation_matrix.symbols.length} names</span>
+                  </div>
+                  <div className="heatmap-wrap">
+                    <table className="corr-table">
+                      <thead>
+                        <tr>
+                          <th />
+                          {result.correlation_matrix.symbols.map((symbol) => <th key={`corr-head-${symbol}`}>{symbol}</th>)}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {result.correlation_matrix.symbols.map((rowSymbol, rowIndex) => (
+                          <tr key={`corr-row-${rowSymbol}`}>
+                            <th>{rowSymbol}</th>
+                            {result.correlation_matrix.symbols.map((colSymbol, colIndex) => {
+                              const value = result.correlation_matrix.values[rowIndex]?.[colIndex] ?? 0;
+                              return (
+                                <td key={`corr-${rowSymbol}-${colSymbol}`} style={{ background: corrCellBg(value) }}>
+                                  {value.toFixed(2)}
+                                </td>
+                              );
+                            })}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
               </div>
 
               {/* Mandate + ML engine */}
@@ -1094,7 +1629,7 @@ function App() {
                     <tbody>
                       {result.optimized_allocations.map((a) => {
                         const badge = getSignalBadge(a);
-                        const v = getAllocVals(a, result.current_portfolio_value, prices, enteredShares);
+                        const v = getAllocVals(a, result.current_portfolio_value, optimizedPortfolioValue, prices, enteredShares);
                         return (
                           <tr key={a.symbol}>
                             <td><span className="tbl-symbol">{a.symbol}</span></td>
@@ -1107,11 +1642,11 @@ function App() {
                             </td>
                             <td>
                               <div>{fmtShares(v.curShares)} sh</div>
-                              <div className="tbl-muted">{fmtCcy(v.curVal)}</div>
+                              <div className="tbl-muted">{fmtCcy(v.curVal)} · {fmtPct(a.current_weight)}</div>
                             </td>
                             <td>
                               <div>{fmtShares(v.optShares)} sh</div>
-                              <div className="tbl-muted">{fmtCcy(v.optVal)}</div>
+                              <div className="tbl-muted">{fmtCcy(v.optVal)} · {fmtPct(a.optimized_weight)}</div>
                             </td>
                             <td>
                               <div className={v.tradeVal >= 0 ? 'up' : 'down'}>{getTrade(v.delta)}</div>
@@ -1170,7 +1705,7 @@ function App() {
                 </div>
                 <div>
                   {result.optimized_allocations.slice(0, 10).map((a) => {
-                    const v = getAllocVals(a, result.current_portfolio_value, prices, enteredShares);
+                    const v = getAllocVals(a, result.current_portfolio_value, optimizedPortfolioValue, prices, enteredShares);
                     return (
                       <div className="compare-item" key={`cmp-${a.symbol}`}>
                         <div className="compare-header">
@@ -1211,7 +1746,7 @@ function App() {
                   </div>
                   {topAdditions.length > 0 ? topAdditions.map((a) => {
                     const badge = getSignalBadge(a);
-                    const v = getAllocVals(a, result.current_portfolio_value, prices, enteredShares);
+                    const v = getAllocVals(a, result.current_portfolio_value, optimizedPortfolioValue, prices, enteredShares);
                     return (
                       <div key={`add-${a.symbol}`} style={{ padding: '0.7rem 0.75rem', borderBottom: '1px solid var(--border)' }}>
                         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.35rem' }}>
@@ -1236,7 +1771,7 @@ function App() {
                     <div className="panel-title">Change Explanations</div>
                   </div>
                   {result.optimized_allocations.filter((a) => a.action !== 'keep').slice(0, 5).map((a) => {
-                    const v = getAllocVals(a, result.current_portfolio_value, prices, enteredShares);
+                    const v = getAllocVals(a, result.current_portfolio_value, optimizedPortfolioValue, prices, enteredShares);
                     return (
                       <div className="explain-item" key={`why-${a.symbol}`}>
                         <div className="explain-header">
@@ -1282,13 +1817,22 @@ function App() {
               <div className="panel">
                 <div className="panel-head">
                   <div className="panel-title">Fund Manager Workspace</div>
-                  {selectedManager && <span className="badge badge-blue">{selectedManager.firm}</span>}
+                  <div className="workspace-actions">
+                    {selectedManager && <span className="badge badge-blue">{selectedManager.firm}</span>}
+                    {selectedManager && (
+                      <>
+                        <button className="btn btn-ghost" style={{ fontSize: '10.5px', padding: '0.3rem 0.7rem' }} onClick={exitWorkspace}>Exit</button>
+                        <button className="btn btn-danger" style={{ fontSize: '10.5px', padding: '0.3rem 0.7rem' }} onClick={deleteActiveWorkspace}>Delete</button>
+                      </>
+                    )}
+                  </div>
                 </div>
                 <div className="panel-body" style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
                   {managers.length > 0 && (
                     <div className="form-field">
                       <div className="field-label">Active manager</div>
-                      <select className="field-input" value={selectedManagerId} onChange={(e) => setSelectedManagerId(e.target.value)}>
+                      <select className="field-input" value={selectedManagerId} onChange={(e) => selectWorkspace(e.target.value)}>
+                        <option value="">Select workspace</option>
                         {managers.map((manager) => (
                           <option key={manager.id} value={manager.id}>{manager.name} — {manager.firm}</option>
                         ))}
@@ -1324,18 +1868,42 @@ function App() {
               </div>
             </div>
 
-            <div className="panel">
-              <div className="panel-head">
-                <div className="panel-title">{consumerHasPortfolio ? 'Save Current Equity Portfolio' : 'Save New Consumer Portfolio'}</div>
-                <button className="btn btn-ghost" style={{ fontSize: '10.5px', padding: '0.3rem 0.7rem' }} onClick={saveCurrentPortfolio}>
-                  {consumerHasPortfolio ? 'Save Current' : 'Save New'}
-                </button>
+              <div className="panel">
+                <div className="panel-head">
+                  <div className="panel-title">{consumerHasPortfolio ? 'Save Current Equity Portfolio' : 'Save New Consumer Portfolio'}</div>
+                <div className="workspace-actions">
+                  <button className="btn btn-ghost" style={{ fontSize: '10.5px', padding: '0.3rem 0.7rem' }} onClick={() => setActiveTab('input')}>
+                    Continue to Input
+                  </button>
+                  <button className="btn btn-ghost" style={{ fontSize: '10.5px', padding: '0.3rem 0.7rem' }} onClick={saveCurrentPortfolio}>
+                    {consumerHasPortfolio ? 'Save Current' : 'Save New'}
+                  </button>
+                </div>
               </div>
               <div className="panel-body">
                 <div className="grid-3">
                   <div className="form-field">
+                    <div className="field-label">Managed consumer</div>
+                    <select className="field-input" value={selectedConsumerId} onChange={(e) => selectConsumer(e.target.value)} disabled={!selectedManagerId || consumers.length === 0}>
+                      <option value="">{consumers.length ? 'Select consumer' : 'No consumers registered'}</option>
+                      {consumers.map((consumer) => (
+                        <option key={consumer.id} value={consumer.id}>
+                          {consumer.name} — {consumer.consumer_has_portfolio ? 'has portfolio' : 'new portfolio'}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="form-field">
                     <div className="field-label">Portfolio name</div>
                     <input className="field-input" value={portfolioName} onChange={(e) => setPortfolioName(e.target.value)} />
+                  </div>
+                  <div className="form-field">
+                    <div className="field-label">Consumer name</div>
+                    <input className="field-input" value={consumerName} onChange={(e) => setConsumerName(e.target.value)} placeholder="e.g. Chinedu Okafor" />
+                  </div>
+                  <div className="form-field">
+                    <div className="field-label">Consumer contact</div>
+                    <input className="field-input" value={consumerEmail} onChange={(e) => setConsumerEmail(e.target.value)} placeholder="optional email or phone" />
                   </div>
                   <div className="form-field">
                     <div className="field-label">Consumer status</div>
@@ -1359,6 +1927,23 @@ function App() {
                     <div className="field-readonly-val">{result ? result.compliance_report.overall_status.toUpperCase() : 'Not run'}</div>
                   </div>
                 </div>
+                <div className="workspace-actions" style={{ marginTop: '0.75rem' }}>
+                  <button className="btn btn-ghost" onClick={startNewConsumer}>New Consumer</button>
+                  {!selectedConsumer && (
+                    <button className="btn btn-ghost" onClick={registerConsumer} disabled={!selectedManagerId || !consumerName.trim()}>
+                      Add Consumer
+                    </button>
+                  )}
+                  {selectedConsumer && (
+                    <>
+                      <button className="btn btn-ghost" onClick={exitConsumer}>Exit Consumer</button>
+                      <button className="btn btn-danger" onClick={deleteActiveConsumer}>Delete Consumer</button>
+                    </>
+                  )}
+                  {selectedConsumer && (
+                    <span className="badge badge-blue">{selectedConsumer.portfolio_count ?? 0} saved portfolio{(selectedConsumer.portfolio_count ?? 0) === 1 ? '' : 's'}</span>
+                  )}
+                </div>
                 {workspaceStatus && <div className="banner banner-ok">{workspaceStatus}</div>}
                 {workspaceError && <div className="banner banner-error">{workspaceError}</div>}
               </div>
@@ -1376,11 +1961,11 @@ function App() {
                       <div>
                         <div className="watch-symbol">{portfolio.name}</div>
                         <div className="watch-reason">
-                          {mandateLabels[portfolio.mandate_profile]} · {portfolio.risk_profile} · {(portfolio.consumer_has_portfolio ?? portfolio.holdings.length > 0) ? `${portfolio.holdings.length} holding${portfolio.holdings.length === 1 ? '' : 's'}` : `new portfolio from ${fmtCcy(portfolio.initial_cash_naira ?? 0)}`}
+                          {(portfolio.consumer_name || 'Unnamed consumer')} · {mandateLabels[portfolio.mandate_profile]} · {portfolio.risk_profile} · {(portfolio.consumer_has_portfolio ?? portfolio.holdings.length > 0) ? `${portfolio.holdings.length} holding${portfolio.holdings.length === 1 ? '' : 's'}` : `new portfolio from ${fmtCcy(portfolio.initial_cash_naira ?? 0)}`}
                         </div>
                         {portfolio.latest_result_summary && (
                           <div className="workspace-run">
-                            Last run {fmtRelative(portfolio.latest_result_summary.generated_at)} · {portfolio.latest_result_summary.compliance_status} · Sharpe {portfolio.latest_result_summary.optimized_sharpe.toFixed(3)}
+                            Last run {fmtRelative(portfolio.latest_result_summary.generated_at)} · {portfolio.latest_result_summary.compliance_status} · Value {fmtCcy(portfolio.latest_result_summary.optimized_portfolio_value ?? portfolio.latest_result_summary.portfolio_value)} · Sharpe {portfolio.latest_result_summary.optimized_sharpe.toFixed(3)}
                           </div>
                         )}
                       </div>

@@ -28,6 +28,7 @@ MIN_HISTORY_DAYS = 90
 TRADING_DAYS = 252
 RANDOM_PORTFOLIO_SAMPLES = 5000
 OPTIMIZER_SEED = 42
+MAX_STOCK_REQUEST = 20
 BACKTEST_LOOKBACK_DAYS = 252
 RISK_FREE_RATE = 0.02
 
@@ -48,6 +49,7 @@ SECTOR_MAP = {
     "AFRIPRUD": "Financial Services",
     "AIICO": "Insurance",
     "AIRTELAFRI": "Telecommunications",
+    "AFRILAND": "Real Estate",
     "ARDOVA": "Oil and Gas",
     "BERGER": "Industrial Goods",
     "BETAGLAS": "Industrial Goods",
@@ -68,6 +70,7 @@ SECTOR_MAP = {
     "DANGSUGAR": "Consumer Goods",
     "ETERNA": "Oil and Gas",
     "ETI": "Banking",
+    "EUNISELL": "Services",
     "FCMB": "Banking",
     "FBNH": "Banking",
     "FIDELITYBK": "Banking",
@@ -132,6 +135,8 @@ SECTOR_MAP = {
     "TRANSCOHOT": "Services",
     "TRANSEXPR": "Services",
     "UACN": "Conglomerates",
+    "UAC-PROP": "Real Estate",
+    "UACPROP": "Real Estate",
     "UBA": "Banking",
     "UBN": "Banking",
     "UCAP": "Financial Services",
@@ -434,10 +439,20 @@ def _load_signal_store_cached(resolved_path: str, mtime_ns: int, size: int) -> p
         else:
             model_return_columns.append(return_col)
 
+    existing_avg_return = None
+    if "Avg_Return" in df.columns:
+        existing_avg_return = pd.to_numeric(df["Avg_Return"], errors="coerce")
+
     if model_return_columns:
         df["Avg_Return"] = df[model_return_columns].mean(axis=1, skipna=True)
+        if existing_avg_return is not None:
+            df["Avg_Return"] = df["Avg_Return"].fillna(existing_avg_return)
     elif "Predicted_Return (%)" in df.columns:
         df["Avg_Return"] = pd.to_numeric(df["Predicted_Return (%)"], errors="coerce")
+        if existing_avg_return is not None:
+            df["Avg_Return"] = df["Avg_Return"].fillna(existing_avg_return)
+    elif existing_avg_return is not None:
+        df["Avg_Return"] = existing_avg_return
     else:
         df["Avg_Return"] = 0.0
     df["Avg_Return"] = df["Avg_Return"].fillna(0.0)
@@ -584,13 +599,25 @@ def _validate_and_normalize_holdings(
 def _prepare_signal_candidates(
     signals_df: pd.DataFrame,
     min_confidence: float = MIN_SIGNAL_CONFIDENCE,
+    signal_scope: str = "buy",
 ) -> pd.DataFrame:
     df = _signal_score_frame(signals_df)
     if "Consensus_Signal" in df.columns:
+        df["Consensus_Signal"] = df["Consensus_Signal"].astype(str).str.upper()
+    else:
+        df["Consensus_Signal"] = "UNKNOWN"
+
+    if signal_scope == "buy":
         df = df[df["Consensus_Signal"] == "BUY"].copy()
+        df = df[df["Consensus_Tier"].fillna(99) <= 2].copy()
+        df = df[df["Avg_Return"].fillna(0) > 0].copy()
+    elif signal_scope == "non_sell":
+        df = df[df["Consensus_Signal"] != "SELL"].copy()
+        df = df[df["Avg_Return"].fillna(0) >= 0].copy()
+    else:
+        raise ValidationError("signal_scope must be one of: buy, non_sell.")
+
     df = df[df["Avg_Confidence"].fillna(0) >= min_confidence].copy()
-    df = df[df["Consensus_Tier"].fillna(99) <= 2].copy()
-    df = df[df["Avg_Return"].fillna(0) > 0].copy()
     df["sector"] = df["Symbol"].map(_sector_for_symbol)
     return df
 
@@ -638,12 +665,17 @@ def _build_candidate_universe(
     max_new_stocks: int,
     min_liquidity_score: float = 0.35,
     min_buy_confidence: float = MIN_SIGNAL_CONFIDENCE,
+    signal_scope: str = "buy",
 ) -> Tuple[List[str], int]:
     current_symbols = holdings_df["symbol"].tolist()
     if not allow_new_stocks or max_new_stocks <= 0:
         return current_symbols, 0
 
-    candidates = _prepare_signal_candidates(signals_df, min_confidence=min_buy_confidence)
+    candidates = _prepare_signal_candidates(
+        signals_df,
+        min_confidence=min_buy_confidence,
+        signal_scope=signal_scope,
+    )
     candidates = candidates[~candidates["Symbol"].isin(current_symbols)].copy()
     if candidates.empty:
         return current_symbols, 0
@@ -714,6 +746,15 @@ def _apply_mandate_to_risk_config(
     return replace(risk_config, **updates) if updates else risk_config
 
 
+def _minimum_stocks_for_profile(risk_profile: str, mandate_profile: str) -> int:
+    _, mandate_config = _mandate_profile_config(mandate_profile)
+    config = _apply_mandate_to_risk_config(
+        _risk_profile_config(risk_profile),
+        mandate_config,
+    )
+    return _minimum_positions_for_cap(config.max_weight)
+
+
 def _expected_returns(
     returns_df: pd.DataFrame,
     signals_df: pd.DataFrame,
@@ -746,7 +787,7 @@ def _expected_returns(
 
 
 def _covariance_matrix(returns_df: pd.DataFrame) -> pd.DataFrame:
-    cov = returns_df.cov() * TRADING_DAYS
+    cov = (returns_df.cov() * TRADING_DAYS).replace([np.inf, -np.inf], np.nan).fillna(0.0)
     diagonal = np.diag(np.diag(cov.values))
     shrunk = 0.80 * cov.values + 0.20 * diagonal
     return pd.DataFrame(shrunk, index=cov.index, columns=cov.columns)
@@ -801,6 +842,7 @@ def _portfolio_metrics(
 ) -> Dict[str, float]:
     expected_return = float(np.dot(weights, mu.values))
     variance = float(weights.T @ cov.values @ weights)
+    variance = variance if math.isfinite(variance) else 0.0
     volatility = math.sqrt(max(variance, 0.0))
     sharpe = (expected_return - RISK_FREE_RATE) / volatility if volatility > 0 else 0.0
 
@@ -960,11 +1002,13 @@ def _fast_score_portfolio(
 ) -> float:
     expected_return = float(np.dot(weights, mu_values))
     variance = float(weights.T @ cov_values @ weights)
+    variance = variance if math.isfinite(variance) else 0.0
     volatility = math.sqrt(max(variance, 0.0))
     sharpe = (expected_return - RISK_FREE_RATE) / volatility if volatility > 0 else 0.0
 
     active = weights - benchmark
     tracking_variance = float(active.T @ cov_values @ active)
+    tracking_variance = tracking_variance if math.isfinite(tracking_variance) else 0.0
     tracking_error = math.sqrt(max(tracking_variance, 0.0))
     information_ratio = (
         (expected_return - benchmark_expected_return) / tracking_error
@@ -1297,6 +1341,7 @@ def _build_compliance_report(
     max_new_stocks: int,
     added_symbols: Sequence[str],
     optimized_metrics: Dict[str, float],
+    is_construction: bool = False,
 ) -> Dict[str, object]:
     active_positions = result_df[result_df["optimized_weight"] > config.allow_exit_threshold].copy()
     max_stock_weight = float(result_df["optimized_weight"].max()) if not result_df.empty else 0.0
@@ -1307,6 +1352,7 @@ def _build_compliance_report(
         else 0.0
     )
     optimized_volatility = float(optimized_metrics.get("volatility", 0.0))
+    effective_turnover = 0.0 if is_construction else turnover
 
     items = [
         _compliance_item(
@@ -1325,9 +1371,9 @@ def _build_compliance_report(
         ),
         _compliance_item(
             "Turnover control",
-            round(turnover, 6),
+            round(effective_turnover, 6),
             round(mandate_config.max_turnover, 6),
-            turnover <= mandate_config.max_turnover + 1e-6,
+            effective_turnover <= mandate_config.max_turnover + 1e-6,
             "Recommended trades should not create excessive rebalancing for the selected mandate.",
             severity="warn",
         ),
@@ -1376,6 +1422,65 @@ def _build_compliance_report(
     }
 
 
+def _format_pct(value: float) -> str:
+    return f"{float(value) * 100:.2f}%"
+
+
+def _minimum_positions_for_cap(max_weight: float) -> int:
+    if max_weight <= 0:
+        return math.inf
+    return int(math.ceil((1.0 - 1e-12) / max_weight))
+
+
+def _validate_mandate_feasibility(
+    candidate_symbols: Sequence[str],
+    sectors: Dict[str, str],
+    config: RiskProfileConfig,
+    mandate_config: MandateProfileConfig,
+    max_new_stocks: int,
+    is_construction: bool,
+) -> None:
+    if not candidate_symbols:
+        raise ValidationError("No eligible assets are available for this mandate.")
+
+    minimum_positions = _minimum_positions_for_cap(config.max_weight)
+    if len(candidate_symbols) < minimum_positions:
+        if is_construction and max_new_stocks < minimum_positions:
+            guidance = f"Increase target stocks to at least {minimum_positions}."
+        elif is_construction:
+            guidance = (
+                f"Only {len(candidate_symbols)} stocks passed the signal, liquidity, and price-history screens. "
+                "Refresh the signals/data, choose a less restrictive mandate, or allow a broader eligible universe."
+            )
+        else:
+            guidance = (
+                f"Increase max_new_stocks or allow more eligible holdings so at least {minimum_positions} stocks can be used."
+            )
+        raise ValidationError(
+            "Mandate infeasible: "
+            f"{mandate_config.label} requires a max single-stock weight of {_format_pct(config.max_weight)}, "
+            f"which needs at least {minimum_positions} active stocks. "
+            f"The current setup provides {len(candidate_symbols)} eligible stocks. {guidance}"
+        )
+
+    sector_count = len(set(sectors.get(symbol, "Other") for symbol in candidate_symbols))
+    minimum_sectors = _minimum_positions_for_cap(config.max_sector_weight)
+    if sector_count < minimum_sectors:
+        raise ValidationError(
+            "Mandate infeasible: "
+            f"{mandate_config.label} requires a max sector weight of {_format_pct(config.max_sector_weight)}, "
+            f"which needs exposure across at least {minimum_sectors} sectors. "
+            f"The current setup provides {sector_count} eligible sector(s). Add stocks from more sectors or choose a less restrictive mandate."
+        )
+
+    if is_construction and max_new_stocks < minimum_positions:
+        raise ValidationError(
+            "Mandate infeasible: "
+            f"target stocks is {max_new_stocks}, but this mandate needs at least {minimum_positions} stocks "
+            f"to satisfy the {_format_pct(config.max_weight)} single-stock cap."
+        )
+
+
 def _build_fund_manager_report(
     mandate_profile: str,
     mandate_config: MandateProfileConfig,
@@ -1390,7 +1495,7 @@ def _build_fund_manager_report(
     elif compliance_report["overall_status"] == "review":
         recommendation = "Review mandate warnings before execution."
     else:
-        recommendation = "Do not execute until compliance breaches are resolved."
+        recommendation = "Optimization completed with mandate exceptions; review the flagged controls before execution."
 
     return {
         "title": "Equity Portfolio Construction Report",
@@ -1516,6 +1621,190 @@ def _build_backtest_summary(
     }
 
 
+def _build_efficient_frontier(
+    returns_df: pd.DataFrame,
+    mu: pd.Series,
+    cov: pd.DataFrame,
+    optimized_weights: pd.Series,
+    current_weights: pd.Series,
+    benchmark_weights: pd.Series,
+    sectors: Dict[str, str],
+    config: RiskProfileConfig,
+) -> Dict[str, object]:
+    symbols = list(returns_df.columns)
+    benchmark = benchmark_weights.reindex(symbols).fillna(0.0)
+    benchmark = benchmark / benchmark.sum() if benchmark.sum() > 0 else pd.Series(1 / len(symbols), index=symbols)
+
+    rng = np.random.default_rng(OPTIMIZER_SEED + 17)
+    alpha = np.maximum(mu.reindex(symbols).fillna(0.0).values - float(mu.min()) + 0.05, 0.02)
+    samples: List[Dict[str, float]] = []
+    sample_count = min(360, max(160, len(symbols) * 24))
+    mu_values = mu.reindex(symbols).fillna(0.0).values
+    cov_values = cov.reindex(index=symbols, columns=symbols).fillna(0.0).values
+
+    def light_metrics(weights: np.ndarray) -> Dict[str, float]:
+        expected_return = float(np.dot(weights, mu_values))
+        variance = float(weights.T @ cov_values @ weights)
+        variance = variance if math.isfinite(variance) else 0.0
+        volatility = math.sqrt(max(variance, 0.0))
+        sharpe = (expected_return - RISK_FREE_RATE) / volatility if volatility > 0 else 0.0
+        return {
+            "expected_return": expected_return,
+            "volatility": volatility,
+            "sharpe": sharpe,
+        }
+
+    for _ in range(sample_count):
+        weights = rng.dirichlet(alpha)
+        weights = _apply_weight_constraints(weights, config, floor=0.0)
+        weights = _apply_sector_constraints(weights, symbols, sectors, config)
+        weights = _normalize_weights(weights)
+        samples.append(light_metrics(weights))
+
+    if not samples:
+        samples = [{"expected_return": 0.0, "volatility": 0.0, "sharpe": 0.0}]
+
+    vol_values = [point["volatility"] for point in samples]
+    min_vol = min(vol_values)
+    max_vol = max(vol_values)
+    frontier_points: List[Dict[str, float]] = []
+    if max_vol > min_vol:
+        bins = np.linspace(min_vol, max_vol, 22)
+        for start, end in zip(bins[:-1], bins[1:]):
+            bucket = [point for point in samples if start <= point["volatility"] <= end]
+            if bucket:
+                frontier_points.append(max(bucket, key=lambda point: point["expected_return"]))
+    else:
+        frontier_points = samples[:1]
+
+    if len(frontier_points) < 5:
+        frontier_points = sorted(samples, key=lambda point: point["sharpe"], reverse=True)[:20]
+    frontier_points = sorted(frontier_points, key=lambda point: point["volatility"])
+
+    def marker(weights: pd.Series) -> Dict[str, float]:
+        aligned = weights.reindex(symbols).fillna(0.0)
+        aligned = aligned / aligned.sum() if aligned.sum() > 0 else pd.Series(1 / len(symbols), index=symbols)
+        return _round_metrics(light_metrics(aligned.values))
+
+    return {
+        "points": [
+            {
+                "expected_return": round(float(point["expected_return"]), 6),
+                "volatility": round(float(point["volatility"]), 6),
+                "sharpe": round(float(point["sharpe"]), 6),
+            }
+            for point in frontier_points[:24]
+        ],
+        "optimized": marker(optimized_weights),
+        "current": marker(current_weights),
+        "benchmark": marker(benchmark),
+    }
+
+
+def _build_correlation_matrix(returns_df: pd.DataFrame, optimized_weights: pd.Series) -> Dict[str, object]:
+    active_symbols = (
+        optimized_weights[optimized_weights > 0]
+        .sort_values(ascending=False)
+        .head(12)
+        .index
+        .tolist()
+    )
+    if not active_symbols:
+        active_symbols = list(returns_df.columns[:12])
+    corr = returns_df.reindex(columns=active_symbols).corr().replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    return {
+        "symbols": active_symbols,
+        "values": [
+            [round(float(corr.loc[row_symbol, col_symbol]), 4) for col_symbol in active_symbols]
+            for row_symbol in active_symbols
+        ],
+    }
+
+
+def _build_risk_contributions(
+    optimized_weights: pd.Series,
+    cov: pd.DataFrame,
+) -> List[Dict[str, float | str]]:
+    symbols = list(optimized_weights.index)
+    weights = optimized_weights.reindex(symbols).fillna(0.0).values
+    cov_values = cov.reindex(index=symbols, columns=symbols).fillna(0.0).values
+    variance = float(weights.T @ cov_values @ weights)
+    variance = variance if math.isfinite(variance) and variance > 0 else 0.0
+    marginal = cov_values @ weights if variance > 0 else np.zeros_like(weights)
+    components = weights * marginal
+    total_component = float(components.sum())
+    if not math.isfinite(total_component) or abs(total_component) <= 1e-12:
+        total_component = 1.0
+        components = weights.copy()
+
+    rows = []
+    for symbol, weight, component in zip(symbols, weights, components):
+        if weight <= 1e-8:
+            continue
+        pct = float(component / total_component)
+        rows.append(
+            {
+                "symbol": symbol,
+                "weight": round(float(weight), 6),
+                "risk_contribution": round(float(component), 8),
+                "risk_contribution_pct": round(pct, 6),
+            }
+        )
+    return sorted(rows, key=lambda row: float(row["risk_contribution_pct"]), reverse=True)
+
+
+def _build_diversification_score(
+    optimized_weights: pd.Series,
+    sectors: Dict[str, str],
+    cov: pd.DataFrame,
+) -> Dict[str, object]:
+    active = optimized_weights[optimized_weights > 1e-8].copy()
+    if active.empty:
+        return {
+            "score": 0,
+            "effective_positions": 0,
+            "active_positions": 0,
+            "largest_weight": 0.0,
+            "largest_sector_weight": 0.0,
+            "message": "No active optimized positions.",
+        }
+
+    hhi = float(np.square(active.values).sum())
+    effective_positions = 1.0 / hhi if hhi > 0 else 0.0
+    sector_weights: Dict[str, float] = {}
+    for symbol, weight in active.items():
+        sector_weights[sectors.get(symbol, "Other")] = sector_weights.get(sectors.get(symbol, "Other"), 0.0) + float(weight)
+    sector_hhi = float(sum(weight * weight for weight in sector_weights.values()))
+    effective_sectors = 1.0 / sector_hhi if sector_hhi > 0 else 0.0
+
+    risk_rows = _build_risk_contributions(active, cov)
+    risk_hhi = float(sum(float(row["risk_contribution_pct"]) ** 2 for row in risk_rows if float(row["risk_contribution_pct"]) > 0))
+    effective_risk_buckets = 1.0 / risk_hhi if risk_hhi > 0 else effective_positions
+
+    position_component = min(effective_positions / max(len(active), 1), 1.0)
+    sector_component = min(effective_sectors / max(len(sector_weights), 1), 1.0)
+    risk_component = min(effective_risk_buckets / max(len(active), 1), 1.0)
+    score = round(100 * (0.45 * position_component + 0.30 * sector_component + 0.25 * risk_component))
+    message = (
+        "Well diversified across positions and sectors."
+        if score >= 75
+        else "Moderate diversification; review concentration hot spots."
+        if score >= 55
+        else "Concentration risk is elevated."
+    )
+
+    return {
+        "score": int(score),
+        "effective_positions": round(float(effective_positions), 2),
+        "active_positions": int(len(active)),
+        "effective_sectors": round(float(effective_sectors), 2),
+        "sector_count": int(len(sector_weights)),
+        "largest_weight": round(float(active.max()), 6),
+        "largest_sector_weight": round(float(max(sector_weights.values())), 6),
+        "message": message,
+    }
+
+
 def optimize_portfolio(
     holdings: Sequence[Dict[str, object]],
     risk_profile: str = "balanced",
@@ -1547,29 +1836,91 @@ def optimize_portfolio(
     )
     rebalance_frequency = _normalize_rebalance_frequency(rebalance_frequency)
     max_new_stocks = int(max_new_stocks)
-    if max_new_stocks < 0 or max_new_stocks > 20:
-        raise ValidationError("max_new_stocks must be between 0 and 20.")
+    if max_new_stocks < 0 or max_new_stocks > MAX_STOCK_REQUEST:
+        raise ValidationError(f"max_new_stocks must be between 0 and {MAX_STOCK_REQUEST}.")
     holding_period_days = int(holding_period_days)
     if holding_period_days <= 0 or holding_period_days > 252:
         raise ValidationError("holding_period_days must be between 1 and 252.")
 
+    minimum_positions = _minimum_positions_for_cap(config.max_weight)
+    current_position_count = 0 if is_construction else int(holdings_df["symbol"].nunique())
+    minimum_new_positions = max(0, minimum_positions - current_position_count)
     effective_allow_new_stocks = True if is_construction else allow_new_stocks
-    effective_max_new_stocks = max(1, max_new_stocks) if is_construction else max_new_stocks
+    if minimum_new_positions > 0:
+        effective_allow_new_stocks = True
+    effective_max_new_stocks = (
+        max(1, max_new_stocks, minimum_positions)
+        if is_construction
+        else max(max_new_stocks, minimum_new_positions)
+    )
     price_df = _load_price_data(price_file)
     asset_metadata = _build_asset_metadata(price_df)
+
+    candidate_request_limit = effective_max_new_stocks
+    if is_construction:
+        candidate_request_limit = min(
+            MAX_STOCK_REQUEST,
+            max(effective_max_new_stocks, effective_max_new_stocks * 2),
+        )
 
     candidate_symbols, liquidity_screened_count = _build_candidate_universe(
         holdings_df=holdings_df,
         signals_df=signals_df,
         asset_metadata=asset_metadata,
         allow_new_stocks=effective_allow_new_stocks,
-        max_new_stocks=effective_max_new_stocks,
+        max_new_stocks=candidate_request_limit,
         min_liquidity_score=mandate_config.min_liquidity_score,
         min_buy_confidence=mandate_config.min_buy_confidence,
     )
 
     returns_df = _build_returns_matrix(price_df, candidate_symbols)
-    candidate_symbols = list(returns_df.columns)
+    if is_construction:
+        candidate_symbols = [symbol for symbol in candidate_symbols if symbol in returns_df.columns]
+        if len(candidate_symbols) > effective_max_new_stocks:
+            candidate_symbols = candidate_symbols[:effective_max_new_stocks]
+        returns_df = returns_df.reindex(columns=candidate_symbols)
+        if len(candidate_symbols) < effective_max_new_stocks:
+            relaxed_symbols, relaxed_count = _build_candidate_universe(
+                holdings_df=holdings_df,
+                signals_df=signals_df,
+                asset_metadata=asset_metadata,
+                allow_new_stocks=effective_allow_new_stocks,
+                max_new_stocks=MAX_STOCK_REQUEST,
+                min_liquidity_score=mandate_config.min_liquidity_score,
+                min_buy_confidence=mandate_config.min_buy_confidence,
+                signal_scope="non_sell",
+            )
+            relaxed_returns_df = _build_returns_matrix(price_df, relaxed_symbols)
+            relaxed_survivors = [symbol for symbol in relaxed_symbols if symbol in relaxed_returns_df.columns]
+            for symbol in relaxed_survivors:
+                if symbol not in candidate_symbols:
+                    candidate_symbols.append(symbol)
+                if len(candidate_symbols) >= effective_max_new_stocks:
+                    break
+            returns_df = relaxed_returns_df.reindex(columns=candidate_symbols)
+            liquidity_screened_count = max(liquidity_screened_count, relaxed_count)
+    else:
+        candidate_symbols = list(returns_df.columns)
+        if len(candidate_symbols) < minimum_positions and effective_allow_new_stocks:
+            relaxed_symbols, relaxed_count = _build_candidate_universe(
+                holdings_df=holdings_df,
+                signals_df=signals_df,
+                asset_metadata=asset_metadata,
+                allow_new_stocks=effective_allow_new_stocks,
+                max_new_stocks=MAX_STOCK_REQUEST,
+                min_liquidity_score=mandate_config.min_liquidity_score,
+                min_buy_confidence=mandate_config.min_buy_confidence,
+                signal_scope="non_sell",
+            )
+            relaxed_returns_df = _build_returns_matrix(price_df, relaxed_symbols)
+            relaxed_survivors = [symbol for symbol in relaxed_symbols if symbol in relaxed_returns_df.columns]
+            for symbol in relaxed_survivors:
+                if symbol not in candidate_symbols:
+                    candidate_symbols.append(symbol)
+                if len(candidate_symbols) >= minimum_positions:
+                    break
+            returns_df = relaxed_returns_df.reindex(columns=candidate_symbols)
+            liquidity_screened_count = max(liquidity_screened_count, relaxed_count)
     if not is_construction and not set(holdings_df["symbol"]).issubset(candidate_symbols):
         missing = sorted(set(holdings_df["symbol"]) - set(candidate_symbols))
         raise ValidationError(f"Not enough price history for holdings: {', '.join(missing)}")
@@ -1580,6 +1931,14 @@ def optimize_portfolio(
         current_weights = holdings_df.set_index("symbol")["current_weight"].reindex(candidate_symbols).fillna(0.0)
         current_weights = current_weights / current_weights.sum()
     sectors = {symbol: _sector_for_symbol(symbol) for symbol in candidate_symbols}
+    _validate_mandate_feasibility(
+        candidate_symbols=candidate_symbols,
+        sectors=sectors,
+        config=config,
+        mandate_config=mandate_config,
+        max_new_stocks=effective_max_new_stocks,
+        is_construction=is_construction,
+    )
 
     metadata = asset_metadata.set_index("symbol").reindex(candidate_symbols)
     latest_prices = metadata["latest_price"]
@@ -1669,10 +2028,24 @@ def optimize_portfolio(
         benchmark_weights,
         rebalance_frequency,
     )
+    efficient_frontier = _build_efficient_frontier(
+        returns_df=returns_df,
+        mu=mu,
+        cov=cov,
+        optimized_weights=optimized_weights_series,
+        current_weights=current_weights,
+        benchmark_weights=benchmark_weights,
+        sectors=sectors,
+        config=config,
+    )
+    correlation_matrix = _build_correlation_matrix(returns_df, optimized_weights_series)
+    risk_contributions = _build_risk_contributions(optimized_weights_series, cov)
+    diversification_score = _build_diversification_score(optimized_weights_series, sectors, cov)
 
     portfolio_value = construction_amount if is_construction else float(holdings_df["amount_naira"].sum())
     turnover = float(np.abs(optimized_weights_series - current_weights).sum() / 2)
     transaction_cost_naira = turnover * config.transaction_cost_rate * portfolio_value
+    optimized_portfolio_value = max(portfolio_value - transaction_cost_naira, 0.0)
     max_sector_weight_after = 0.0
     if sector_allocations:
         max_sector_weight_after = max(item["optimized_weight"] for item in sector_allocations)
@@ -1687,6 +2060,7 @@ def optimize_portfolio(
         max_new_stocks=max_new_stocks,
         added_symbols=added_symbols,
         optimized_metrics=optimized_metrics,
+        is_construction=is_construction,
     )
     fund_manager_report = _build_fund_manager_report(
         mandate_profile=mandate_profile,
@@ -1744,6 +2118,7 @@ def optimize_portfolio(
         "rebalance_frequency": rebalance_frequency,
         "holding_period_days": holding_period_days,
         "current_portfolio_value": round(portfolio_value, 2),
+        "optimized_portfolio_value": round(optimized_portfolio_value, 2),
         "initial_cash_naira": round(construction_amount, 2) if is_construction else None,
         "current_weights": [
             {
@@ -1770,6 +2145,10 @@ def optimize_portfolio(
         "compliance_report": compliance_report,
         "benchmark_metrics": _round_metrics(benchmark_metrics),
         "backtest_summary": backtest_summary,
+        "efficient_frontier": efficient_frontier,
+        "correlation_matrix": correlation_matrix,
+        "risk_contributions": risk_contributions,
+        "diversification_score": diversification_score,
         "fund_manager_report": fund_manager_report,
         "summary_metrics": {
             "candidate_count": int(len(candidate_symbols)),
@@ -1796,7 +2175,7 @@ def optimize_portfolio(
 def construct_portfolio(
     initial_cash_naira: float,
     risk_profile: str = "balanced",
-    max_stocks: int = 8,
+    max_stocks: int | None = None,
     price_file: str = PRICE_FILE,
     signal_file: str = SIGNAL_FILE,
     stale_after_hours: int = STALE_SIGNAL_HOURS,
@@ -1804,12 +2183,17 @@ def construct_portfolio(
     holding_period_days: int = 20,
     mandate_profile: str = "balanced_equity",
 ) -> Dict[str, object]:
+    target_stocks = (
+        _minimum_stocks_for_profile(risk_profile, mandate_profile)
+        if max_stocks is None
+        else int(max_stocks)
+    )
     return optimize_portfolio(
         holdings=[],
         risk_profile=risk_profile,
         mandate_profile=mandate_profile,
         allow_new_stocks=True,
-        max_new_stocks=max_stocks,
+        max_new_stocks=target_stocks,
         price_file=price_file,
         signal_file=signal_file,
         stale_after_hours=stale_after_hours,

@@ -16,6 +16,17 @@ export type FundManager = {
   updated_at: string;
 };
 
+export type ManagedConsumer = {
+  id: string;
+  manager_id: string;
+  name: string;
+  email: string;
+  consumer_has_portfolio: boolean;
+  portfolio_count?: number;
+  created_at: string;
+  updated_at: string;
+};
+
 export type SavedHolding = {
   symbol: string;
   amount_naira: number;
@@ -24,6 +35,7 @@ export type SavedHolding = {
 export type OptimizationRunSummary = {
   generated_at: string;
   portfolio_value: number;
+  optimized_portfolio_value?: number;
   compliance_status: string;
   optimized_expected_return: number;
   optimized_sharpe: number;
@@ -34,7 +46,10 @@ export type OptimizationRunSummary = {
 export type SavedPortfolio = {
   id: string;
   manager_id: string;
+  consumer_id?: string;
   name: string;
+  consumer_name?: string;
+  consumer_email?: string;
   consumer_has_portfolio?: boolean;
   initial_cash_naira?: number | null;
   holdings: SavedHolding[];
@@ -130,6 +145,19 @@ export type StrategyBacktest = {
   max_drawdown: number;
 };
 
+export type FrontierPoint = {
+  expected_return: number;
+  volatility: number;
+  sharpe: number;
+};
+
+export type RiskContribution = {
+  symbol: string;
+  weight: number;
+  risk_contribution: number;
+  risk_contribution_pct: number;
+};
+
 export type OptimizationResponse = {
   portfolio_mode?: 'optimization' | 'construction';
   risk_profile: RiskProfile;
@@ -160,6 +188,7 @@ export type OptimizationResponse = {
   rebalance_frequency: 'weekly' | 'monthly' | 'quarterly';
   holding_period_days: number;
   current_portfolio_value: number;
+  optimized_portfolio_value?: number;
   initial_cash_naira?: number | null;
   current_weights: CurrentWeight[];
   optimized_allocations: OptimizedAllocation[];
@@ -209,6 +238,27 @@ export type OptimizationResponse = {
       equal_weight: StrategyBacktest;
       benchmark: StrategyBacktest;
     };
+  };
+  efficient_frontier: {
+    points: FrontierPoint[];
+    optimized: FrontierPoint;
+    current: FrontierPoint;
+    benchmark: FrontierPoint;
+  };
+  correlation_matrix: {
+    symbols: string[];
+    values: number[][];
+  };
+  risk_contributions: RiskContribution[];
+  diversification_score: {
+    score: number;
+    effective_positions: number;
+    active_positions: number;
+    effective_sectors: number;
+    sector_count: number;
+    largest_weight: number;
+    largest_sector_weight: number;
+    message: string;
   };
   fund_manager_report: {
     title: string;
