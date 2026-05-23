@@ -249,7 +249,7 @@ function App() {
   const [prices, setPrices] = useState<Record<string, number>>({});
   const [signalSummary, setSignalSummary] = useState<SignalSummary | null>(null);
   const [priceUpdatedAt, setPriceUpdatedAt] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState<NavTab>('workspace');
+  const [activeTab, setActiveTab] = useState<NavTab>('watchlist');
   const [managers, setManagers] = useState<FundManager[]>([]);
   const [selectedManagerId, setSelectedManagerId] = useState('');
   const [consumers, setConsumers] = useState<ManagedConsumer[]>([]);
