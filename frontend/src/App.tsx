@@ -778,7 +778,7 @@ function App() {
     setMandateProfile(portfolio.mandate_profile);
     setAllowNewStocks(portfolio.allow_new_stocks);
     setMaxNewStocks(Math.min(20, portfolio.max_new_stocks));
-    setRebalanceFrequency(portfolio.rebalance_frequency);
+    setRebalanceFrequency(portfolio.rebalance_frequency as RebalanceFrequency);
     setHoldingPeriodDays(portfolio.holding_period_days);
     setPortfolioName(portfolio.name);
     setSelectedConsumerId(portfolio.consumer_id ?? '');
@@ -2425,14 +2425,14 @@ function App() {
                             <button className="btn btn-primary" style={{ fontSize: '11px', padding: '0.3rem 0.7rem' }} onClick={() => optimizeSavedPortfolio(portfolio)}>
                               Optimize Now
                             </button>
-                            {summary?.added_symbols?.length > 0 && (
+                            {(summary?.added_symbols?.length ?? 0) > 0 && (
                               <span style={{ fontSize: '11.5px', color: 'var(--text-3)', alignSelf: 'center' }}>
-                                Last added: {summary.added_symbols.slice(0, 4).join(', ')}{summary.added_symbols.length > 4 ? ` +${summary.added_symbols.length - 4}` : ''}
+                                Last added: {summary?.added_symbols?.slice(0, 4).join(', ')}{(summary?.added_symbols?.length ?? 0) > 4 ? ` +${(summary?.added_symbols?.length ?? 0) - 4}` : ''}
                               </span>
                             )}
-                            {summary?.removed_symbols?.length > 0 && (
+                            {(summary?.removed_symbols?.length ?? 0) > 0 && (
                               <span style={{ fontSize: '11.5px', color: 'var(--red-400)', alignSelf: 'center' }}>
-                                Removed: {summary.removed_symbols.slice(0, 4).join(', ')}{summary.removed_symbols.length > 4 ? ` +${summary.removed_symbols.length - 4}` : ''}
+                                Removed: {summary?.removed_symbols?.slice(0, 4).join(', ')}{(summary?.removed_symbols?.length ?? 0) > 4 ? ` +${(summary?.removed_symbols?.length ?? 0) - 4}` : ''}
                               </span>
                             )}
                           </div>
