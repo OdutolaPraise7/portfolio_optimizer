@@ -12,10 +12,20 @@ from app_snapshots import (
     get_signal_watchlist,
     get_supported_symbols,
 )
+from outcome_store import (
+    export_trades_csv,
+    get_symbol_alpha_signal,
+    get_symbol_outcome_history,
+    list_outcome_trades,
+    record_optimization_trades,
+    record_price_snapshot,
+)
+from batch_optimiser import run_batch_optimization
 from portfolio_store import (
     PortfolioNotFoundError,
     PortfolioStoreError,
     PortfolioStoreValidationError,
+    authenticate_manager,
     create_consumer,
     create_manager,
     create_portfolio,
@@ -165,7 +175,13 @@ class ConstructPortfolioRequest(BaseModel):
 class ManagerCreateRequest(BaseModel):
     name: str = Field(..., min_length=1, description="Fund manager name")
     firm: str = Field(..., min_length=1, description="Fund management firm")
-    email: str = Field("", description="Optional email or internal contact")
+    email: str = Field(..., min_length=3, description="Email address (used for login)")
+    password: str = Field(..., min_length=8, description="Password (minimum 8 characters)")
+
+
+class ManagerLoginRequest(BaseModel):
+    email: str
+    password: str
 
 
 class ConsumerCreateRequest(BaseModel):
@@ -264,7 +280,6 @@ def bootstrap() -> dict:
             "symbols": get_supported_symbols(),
             "prices": market["prices"],
             "price_updated_at": market["updated_at"],
-            "managers": list_managers(),
         }
         try:
             payload["signal_summary"] = get_signal_summary()
@@ -310,9 +325,17 @@ def fund_managers() -> dict:
 @app.post("/fund-managers")
 def create_fund_manager(payload: ManagerCreateRequest) -> dict:
     try:
-        return {"manager": create_manager(payload.name, payload.firm, payload.email)}
+        return {"manager": create_manager(payload.name, payload.firm, payload.email, payload.password)}
     except PortfolioStoreError as exc:
         raise _handle_store_error(exc) from exc
+
+
+@app.post("/fund-managers/login")
+def login_fund_manager(payload: ManagerLoginRequest) -> dict:
+    try:
+        return {"manager": authenticate_manager(payload.email, payload.password)}
+    except PortfolioStoreError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
 
 
 @app.delete("/fund-managers/{manager_id}")
@@ -429,3 +452,99 @@ def optimize_saved_portfolio(portfolio_id: str) -> dict:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except optimizer.SignalStoreError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+# ── BATCH OPTIMIZATION ────────────────────────────────────────────────────────
+
+class BatchOptimizeRequest(BaseModel):
+    portfolio_ids: List[str] = Field(..., min_length=1, description="List of saved portfolio IDs to optimize in one batch")
+
+
+@app.post("/fund-managers/{manager_id}/batch-optimize")
+def batch_optimize(manager_id: str, payload: BatchOptimizeRequest) -> dict:
+    """
+    Optimize all selected client portfolios at once.
+    Results are persisted to portfolio_store (run history) and outcome_store
+    (trade-level outcome tracking for cross-client learning).
+    """
+    optimizer = _optimizer_module()
+    try:
+        return run_batch_optimization(
+            manager_id=manager_id,
+            portfolio_ids=payload.portfolio_ids,
+            optimizer_module=optimizer,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+# ── OUTCOME STORE ─────────────────────────────────────────────────────────────
+
+@app.get("/outcomes/trades")
+def outcome_trades(
+    manager_id: str | None = None,
+    portfolio_id: str | None = None,
+    symbol: str | None = None,
+    settled_only: bool = False,
+    limit: int = 500,
+) -> dict:
+    """
+    Query recorded trade outcomes.  Supports filtering by manager, portfolio,
+    symbol, and whether the outcome (realised return) has been captured yet.
+    """
+    trades = list_outcome_trades(
+        manager_id=manager_id,
+        portfolio_id=portfolio_id,
+        symbol=symbol.upper() if symbol else None,
+        settled_only=settled_only,
+        limit=limit,
+    )
+    return {"trades": trades, "count": len(trades)}
+
+
+@app.get("/outcomes/symbol/{symbol}")
+def symbol_outcome_history(symbol: str) -> dict:
+    """All recorded trade rows for a single ticker."""
+    return {
+        "symbol": symbol.upper(),
+        "trades": get_symbol_outcome_history(symbol),
+        "alpha_signal": get_symbol_alpha_signal(symbol),
+    }
+
+
+@app.get("/outcomes/alpha/{symbol}")
+def symbol_alpha(symbol: str) -> dict:
+    """
+    Aggregated historical accuracy for a symbol.
+    Use this to answer: 'did Chevron positions pay off in the past?'
+    hit_rate, mean_realised_return, mean_prediction_error, etc.
+    """
+    return get_symbol_alpha_signal(symbol)
+
+
+@app.post("/outcomes/record-prices")
+def record_current_prices() -> dict:
+    """
+    Capture today's prices from PRICE_LIST and resolve any open trades whose
+    holding period has elapsed.  Call this once a day (e.g. via a cron job or
+    a button in the UI).
+    """
+    try:
+        snapshot = get_latest_price_snapshot()
+        prices = snapshot.get("prices", {})
+        updated = record_price_snapshot(prices, capture_date=None)
+        return {
+            "status": "ok",
+            "prices_captured": len(prices),
+            "trades_resolved": updated,
+            "updated_at": snapshot.get("updated_at"),
+        }
+    except SnapshotError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.get("/outcomes/export-csv")
+def outcomes_export_csv() -> dict:
+    """Force-sync the CSV mirror from the DB and return its path."""
+    path = export_trades_csv()
+    return {"csv_path": str(path)}

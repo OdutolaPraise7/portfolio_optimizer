@@ -12,6 +12,7 @@ produce the signal store without generating hundreds of extra files.
 import gc
 import os
 import traceback
+from config import PRICE_FILE, SIGNAL_FILE as OUTPUT_FILE
 
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 
@@ -57,7 +58,7 @@ def is_equity(symbol):
     return not any(kw in symbol.upper() for kw in non_equity_keywords)
 
 
-def load_market_data(filepath='PRICE_LIST.csv'):
+def load_market_data(filepath=str(PRICE_FILE)):
     # merge_signals reads the market data once, then slices it per symbol for each model.
     from preprocess import preprocess
 
@@ -409,7 +410,7 @@ def main():
 
     print("\nLoading data...")
     # All three models run symbol-by-symbol off the same preprocessed table.
-    market_df = load_market_data('PRICE_LIST.csv')
+    market_df = load_market_data(str(PRICE_FILE))
     symbol_counts = market_df[market_df['SYMBOL'].apply(is_equity)].groupby('SYMBOL').size()
     valid_symbols = [
         symbol for symbol in symbol_counts.sort_values(ascending=False).index
@@ -577,7 +578,7 @@ def main():
 
     print(f"\n{'=' * 60}")
     signal_store = merge_results(xgb_res, rf_res, lstm_res)
-    signal_store, fallback_rows = augment_signal_store_with_fallbacks(signal_store, price_file='PRICE_LIST.csv')
+    signal_store, fallback_rows = augment_signal_store_with_fallbacks(signal_store, price_file=str(PRICE_FILE))
     signal_store.to_csv(OUTPUT_FILE, index=False)
     print(f"{OUTPUT_FILE} saved ({len(signal_store)} symbols)")
     print(f"Fallback signal rows added: {len(fallback_rows)}")

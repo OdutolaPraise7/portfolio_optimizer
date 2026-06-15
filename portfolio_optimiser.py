@@ -6,6 +6,7 @@ from functools import lru_cache
 from pathlib import Path
 from threading import Lock
 from typing import Dict, List, Sequence, Tuple
+from config import PRICE_FILE, SIGNAL_FILE
 
 import numpy as np
 import pandas as pd
@@ -498,7 +499,7 @@ def _signal_score_frame(df: pd.DataFrame) -> pd.DataFrame:
 def get_signal_watchlist(
     signal_file: str = SIGNAL_FILE,
     stale_after_hours: int = STALE_SIGNAL_HOURS,
-    limit: int = 5,
+    limit: int = 10,
 ) -> Dict[str, object]:
     df = _signal_score_frame(load_signal_store(signal_file, stale_after_hours))
     if "Consensus_Signal" not in df.columns:

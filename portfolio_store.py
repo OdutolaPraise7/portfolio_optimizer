@@ -1,4 +1,6 @@
+import hashlib
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
@@ -61,6 +63,26 @@ def _save_store(data: Dict[str, Any], store_file: str | Path | None = None) -> N
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
+def _hash_password(password: str) -> str:
+    salt = os.urandom(32)
+    key = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 200_000)
+    return salt.hex() + ":" + key.hex()
+
+
+def _verify_password(password: str, stored: str) -> bool:
+    try:
+        salt_hex, key_hex = stored.split(":", 1)
+        salt = bytes.fromhex(salt_hex)
+        key = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 200_000)
+        return key.hex() == key_hex
+    except Exception:
+        return False
+
+
+def _strip_password(manager: Dict[str, Any]) -> Dict[str, Any]:
+    return {k: v for k, v in manager.items() if k != "password_hash"}
+
+
 def _summary_from_result(result: Dict[str, Any] | None) -> Dict[str, Any] | None:
     if not result:
         return None
@@ -81,36 +103,61 @@ def _summary_from_result(result: Dict[str, Any] | None) -> Dict[str, Any] | None
 
 def list_managers(store_file: str | Path | None = None) -> List[Dict[str, Any]]:
     with _LOCK:
-        return _load_store(store_file)["managers"]
+        return [_strip_password(m) for m in _load_store(store_file)["managers"]]
 
 
 def create_manager(
     name: str,
     firm: str,
-    email: str = "",
+    email: str,
+    password: str,
     store_file: str | Path | None = None,
 ) -> Dict[str, Any]:
     name = str(name or "").strip()
     firm = str(firm or "").strip()
-    email = str(email or "").strip()
+    email = str(email or "").strip().lower()
     if not name:
         raise PortfolioStoreValidationError("Fund manager name is required.")
     if not firm:
         raise PortfolioStoreValidationError("Firm name is required.")
+    if not email:
+        raise PortfolioStoreValidationError("Email address is required.")
+    if len(password) < 8:
+        raise PortfolioStoreValidationError("Password must be at least 8 characters.")
 
     with _LOCK:
         data = _load_store(store_file)
+        if any(m.get("email", "").lower() == email for m in data["managers"]):
+            raise PortfolioStoreValidationError("An account with this email already exists.")
         manager = {
             "id": _new_id("mgr"),
             "name": name,
             "firm": firm,
             "email": email,
+            "password_hash": _hash_password(password),
             "created_at": _now(),
             "updated_at": _now(),
         }
         data["managers"].append(manager)
         _save_store(data, store_file)
-        return manager
+        return _strip_password(manager)
+
+
+def authenticate_manager(
+    email: str,
+    password: str,
+    store_file: str | Path | None = None,
+) -> Dict[str, Any]:
+    email = str(email or "").strip().lower()
+    with _LOCK:
+        data = _load_store(store_file)
+        manager = next(
+            (m for m in data["managers"] if m.get("email", "").lower() == email),
+            None,
+        )
+    if manager is None or not _verify_password(password, manager.get("password_hash", "")):
+        raise PortfolioStoreValidationError("Invalid email or password.")
+    return _strip_password(manager)
 
 
 def get_manager(manager_id: str, store_file: str | Path | None = None) -> Dict[str, Any]:
@@ -118,7 +165,7 @@ def get_manager(manager_id: str, store_file: str | Path | None = None) -> Dict[s
         data = _load_store(store_file)
         for manager in data["managers"]:
             if manager["id"] == manager_id:
-                return manager
+                return _strip_password(manager)
     raise PortfolioNotFoundError(f"Fund manager not found: {manager_id}")
 
 

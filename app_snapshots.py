@@ -5,6 +5,7 @@ from functools import lru_cache
 from pathlib import Path
 from threading import Lock
 from typing import Dict, List, Tuple
+from config import PRICE_FILE, SIGNAL_FILE
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -213,7 +214,7 @@ def get_signal_summary(
 def get_signal_watchlist(
     signal_file: str | Path = SIGNAL_FILE,
     stale_after_hours: int = STALE_SIGNAL_HOURS,
-    limit: int = 5,
+    limit: int = 10,
 ) -> Dict[str, object]:
     rows, _, _, _ = _load_signal_rows(signal_file, stale_after_hours)
 

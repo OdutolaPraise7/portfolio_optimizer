@@ -5,6 +5,7 @@ import numpy as np
 import ta
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from config import PRICE_FILE as DATA_FILEPATH
 
 # On some macOS/PyTorch CPU builds, the default BLAS/OpenMP thread pool can
 # stall during recurrent training. Conservative defaults keep merge runs moving.

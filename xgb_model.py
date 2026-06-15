@@ -7,6 +7,7 @@ from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from preprocess import preprocess
+from config import PRICE_FILE as DATA_FILEPATH
 
 DATA_FILEPATH = 'PRICE_LIST.csv'
 TARGET_HORIZON = 20

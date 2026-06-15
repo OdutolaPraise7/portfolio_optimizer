@@ -15,7 +15,7 @@ import type {
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://127.0.0.1:8000';
 type RebalanceFrequency = 'weekly' | 'monthly' | 'quarterly';
-type NavTab = 'overview' | 'watchlist' | 'input' | 'dashboard' | 'workspace' | 'data';
+type NavTab = 'overview' | 'watchlist' | 'input' | 'dashboard' | 'workspace' | 'clients';
 type ConsumerPortfolioStatus = 'existing' | 'new';
 type BootstrapResponse = {
   symbols?: string[];
@@ -23,7 +23,6 @@ type BootstrapResponse = {
   price_updated_at?: string | null;
   signal_summary?: SignalSummary | null;
   watchlist?: SignalWatchlist | null;
-  managers?: FundManager[];
   signal_error?: string;
 };
 
@@ -84,6 +83,9 @@ const fmtShares = (v: number) =>
 
 const fmtDateTime = (v: string | null) =>
   v ? new Intl.DateTimeFormat('en-NG', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(v)) : 'Unavailable';
+
+const fmtDate = (v: string | null) =>
+  v ? new Intl.DateTimeFormat('en-NG', { day: 'numeric', month: 'long', year: 'numeric' }).format(new Date(v)) : 'Unavailable';
 
 const fmtRelative = (v: string | null) => {
   if (!v) return '—';
@@ -216,14 +218,20 @@ const Icon = {
   chart: () => (
     <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round"><polyline points="1,10 4,6 7,8 10,3 13,5"/></svg>
   ),
-  db: () => (
-    <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round"><ellipse cx="7" cy="4" rx="5" ry="2"/><path d="M2 4v3c0 1.1 2.24 2 5 2s5-.9 5-2V4"/><path d="M2 7v3c0 1.1 2.24 2 5 2s5-.9 5-2V7"/></svg>
-  ),
   user: () => (
     <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round"><circle cx="7" cy="4" r="2.2"/><path d="M2.5 12c.7-2.3 2.2-3.4 4.5-3.4s3.8 1.1 4.5 3.4"/></svg>
   ),
+  users: () => (
+    <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round"><circle cx="5" cy="4" r="2"/><path d="M1.5 12c.6-2 2-3 3.5-3s2.9 1 3.5 3"/><circle cx="10" cy="4.5" r="1.5"/><path d="M12.5 12c-.5-1.8-1.5-2.6-2.5-2.6"/></svg>
+  ),
   chevron: () => (
     <svg viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"><path d="M3 4l2 2 2-2"/></svg>
+  ),
+  chevronRight: () => (
+    <svg viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"><path d="M4 3l2 2-2 2"/></svg>
+  ),
+  history: () => (
+    <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round"><path d="M1.5 7a5.5 5.5 0 1 0 1-3.2"/><polyline points="1.5,2 1.5,5 4.5,5"/><path d="M7 4.5V7l1.8 1.8"/></svg>
   ),
 };
 
@@ -233,7 +241,7 @@ function App() {
   const [symbols, setSymbols] = useState<string[]>([]);
   const [holdings, setHoldings] = useState<Holding[]>(initialHoldings);
   const [consumerPortfolioStatus, setConsumerPortfolioStatus] = useState<ConsumerPortfolioStatus>('existing');
-  const [initialCashNaira, setInitialCashNaira] = useState(5_000_000);
+  const [initialCashNaira, setInitialCashNaira] = useState(0);
   const [riskProfile, setRiskProfile] = useState<RiskProfile>('balanced');
   const [mandateProfile, setMandateProfile] = useState<MandateProfile>('balanced_equity');
   const [allowNewStocks, setAllowNewStocks] = useState(true);
@@ -249,7 +257,7 @@ function App() {
   const [prices, setPrices] = useState<Record<string, number>>({});
   const [signalSummary, setSignalSummary] = useState<SignalSummary | null>(null);
   const [priceUpdatedAt, setPriceUpdatedAt] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState<NavTab>('watchlist');
+  const [activeTab, setActiveTab] = useState<NavTab>('overview');
   const [managers, setManagers] = useState<FundManager[]>([]);
   const [selectedManagerId, setSelectedManagerId] = useState('');
   const [consumers, setConsumers] = useState<ManagedConsumer[]>([]);
@@ -263,6 +271,18 @@ function App() {
   const [consumerEmail, setConsumerEmail] = useState('');
   const [workspaceStatus, setWorkspaceStatus] = useState<string | null>(null);
   const [workspaceError, setWorkspaceError] = useState<string | null>(null);
+  const [loginEmail, setLoginEmail] = useState('');
+  const [loginPassword, setLoginPassword] = useState('');
+  const [managerPassword, setManagerPassword] = useState('');
+  const [authView, setAuthView] = useState<'register' | 'login'>('register');
+
+  // Clients tab state
+  const [expandedPortfolioId, setExpandedPortfolioId] = useState<string | null>(null);
+  const [portfolioRuns, setPortfolioRuns] = useState<Record<string, any[]>>({});
+  const [runsLoading, setRunsLoading] = useState<string | null>(null);
+  const [batchSelected, setBatchSelected] = useState<Set<string>>(new Set());
+  const [batchRunning, setBatchRunning] = useState(false);
+  const [batchResult, setBatchResult] = useState<{ succeeded: number; failed: number; results: any[] } | null>(null);
 
   const sortedSymbols = useMemo(() => [...symbols].sort((a, b) => a.localeCompare(b)), [symbols]);
   const selectedManager = useMemo(
@@ -334,10 +354,6 @@ function App() {
         setSignalSummary(data.signal_summary ?? null);
         setWatchlist(data.watchlist ?? null);
         if (data.signal_error) setError(data.signal_error);
-
-        const loadedManagers = data.managers ?? [];
-        setManagers(loadedManagers);
-        setSelectedManagerId((current) => current || loadedManagers[0]?.id || '');
       } catch (e) {
         setError(e instanceof Error ? e.message : 'Failed to load data.');
       }
@@ -500,23 +516,49 @@ function App() {
     setConsumers(data.consumers ?? []);
   };
 
+  const loginManager = async () => {
+    setWorkspaceError(null); setWorkspaceStatus(null);
+    if (!loginEmail.trim()) { setWorkspaceError('Enter your email address.'); return; }
+    if (!loginPassword) { setWorkspaceError('Enter your password.'); return; }
+    try {
+      const res = await fetch(`${API_BASE_URL}/fund-managers/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: loginEmail.trim().toLowerCase(), password: loginPassword }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail ?? 'Login failed.');
+      const manager: FundManager = data.manager;
+      setManagers((current) => current.some((m) => m.id === manager.id) ? current : [manager, ...current]);
+      setSelectedManagerId(manager.id);
+      setLoginEmail('');
+      setLoginPassword('');
+    } catch (e) {
+      setWorkspaceError(e instanceof Error ? e.message : 'Login failed.');
+    }
+  };
+
   const createManagerAccount = async () => {
     setWorkspaceError(null); setWorkspaceStatus(null);
+    if (managerPassword.length < 8) {
+      setWorkspaceError('Password must be at least 8 characters.');
+      return;
+    }
     try {
       const res = await fetch(`${API_BASE_URL}/fund-managers`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: managerName, firm: managerFirm, email: managerEmail }),
+        body: JSON.stringify({ name: managerName, firm: managerFirm, email: managerEmail, password: managerPassword }),
       });
       const data = await res.json();
-      if (!res.ok) throw new Error(data.detail ?? 'Could not create fund manager account.');
+      if (!res.ok) throw new Error(data.detail ?? 'Could not create account.');
       const manager: FundManager = data.manager;
       setManagers((current) => [manager, ...current]);
       setSelectedManagerId(manager.id);
-      setManagerName(''); setManagerFirm(''); setManagerEmail('');
-      setWorkspaceStatus('Fund manager workspace created.');
+      setManagerName(''); setManagerFirm(''); setManagerEmail(''); setManagerPassword('');
+      setWorkspaceStatus('Account created. Welcome!');
     } catch (e) {
-      setWorkspaceError(e instanceof Error ? e.message : 'Could not create fund manager account.');
+      setWorkspaceError(e instanceof Error ? e.message : 'Could not create account.');
     }
   };
 
@@ -545,15 +587,15 @@ function App() {
     setWorkspaceError(null);
   };
 
-  const registerConsumer = async () => {
+  const registerConsumer = async (): Promise<ManagedConsumer | null> => {
     setWorkspaceError(null); setWorkspaceStatus(null);
     if (!selectedManagerId) {
       setWorkspaceError('Select a manager workspace before adding a consumer.');
-      return;
+      return null;
     }
     if (!consumerName.trim()) {
       setWorkspaceError('Enter the consumer name before adding.');
-      return;
+      return null;
     }
     try {
       const res = await fetch(`${API_BASE_URL}/fund-managers/${selectedManagerId}/consumers`, {
@@ -574,8 +616,10 @@ function App() {
       setConsumerEmail(consumer.email ?? '');
       setConsumerPortfolioStatus(consumer.consumer_has_portfolio ? 'existing' : 'new');
       setWorkspaceStatus(`Added ${consumer.name}.`);
+      return consumer;
     } catch (e) {
       setWorkspaceError(e instanceof Error ? e.message : 'Could not add consumer.');
+      return null;
     }
   };
 
@@ -635,8 +679,11 @@ function App() {
     setSavedPortfolios([]);
     setConsumerName('');
     setConsumerEmail('');
+    setLoginEmail('');
+    setLoginPassword('');
+    setAuthView('register');
     setWorkspaceError(null);
-    setWorkspaceStatus('Exited active workspace.');
+    setWorkspaceStatus(null);
   };
 
   const deleteActiveWorkspace = async () => {
@@ -725,7 +772,7 @@ function App() {
       };
     });
     setConsumerPortfolioStatus(hasPortfolio ? 'existing' : 'new');
-    setInitialCashNaira(portfolio.initial_cash_naira ?? 5_000_000);
+    setInitialCashNaira(portfolio.initial_cash_naira ?? 0);
     setHoldings(loadedHoldings.length ? loadedHoldings : initialHoldings);
     setRiskProfile(portfolio.risk_profile);
     setMandateProfile(portfolio.mandate_profile);
@@ -754,6 +801,73 @@ function App() {
     } catch (e) {
       setWorkspaceError(friendlyErrorMessage(e instanceof Error ? e.message : '', 'Could not optimize saved portfolio.'));
       setWorkspaceStatus(null);
+    }
+  };
+
+  const loadPortfolioRuns = async (portfolioId: string) => {
+    if (portfolioRuns[portfolioId]) {
+      // toggle closed if already open
+      setExpandedPortfolioId((current) => current === portfolioId ? null : portfolioId);
+      return;
+    }
+    setRunsLoading(portfolioId);
+    try {
+      const res = await fetch(`${API_BASE_URL}/portfolios/${portfolioId}`, { cache: 'no-store' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail ?? 'Could not load run history.');
+      setPortfolioRuns((current) => ({ ...current, [portfolioId]: data.runs ?? [] }));
+      setExpandedPortfolioId(portfolioId);
+    } catch (e) {
+      setWorkspaceError(e instanceof Error ? e.message : 'Could not load run history.');
+    } finally {
+      setRunsLoading(null);
+    }
+  };
+
+  const toggleBatchSelect = (portfolioId: string) => {
+    setBatchSelected((current) => {
+      const next = new Set(current);
+      next.has(portfolioId) ? next.delete(portfolioId) : next.add(portfolioId);
+      return next;
+    });
+  };
+
+  const selectAllPortfolios = () => {
+    setBatchSelected(new Set(savedPortfolios.map((p) => p.id)));
+  };
+
+  const clearBatchSelection = () => {
+    setBatchSelected(new Set());
+    setBatchResult(null);
+  };
+
+  const runBatchOptimize = async () => {
+    if (!selectedManagerId || batchSelected.size === 0) return;
+    setBatchRunning(true);
+    setBatchResult(null);
+    setWorkspaceError(null);
+    try {
+      const res = await fetch(`${API_BASE_URL}/fund-managers/${selectedManagerId}/batch-optimize`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ portfolio_ids: [...batchSelected] }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail ?? 'Batch optimization failed.');
+      setBatchResult({ succeeded: data.succeeded, failed: data.failed, results: data.results });
+      // Refresh portfolios so latest_result_summary updates
+      await refreshPortfolios(selectedManagerId);
+      // Invalidate run caches for re-fetch on next expand
+      setBatchSelected(new Set());
+      setPortfolioRuns((current) => {
+        const next = { ...current };
+        data.results.forEach((r: any) => { if (r.success) delete next[r.portfolio_id]; });
+        return next;
+      });
+    } catch (e) {
+      setWorkspaceError(e instanceof Error ? e.message : 'Batch optimization failed.');
+    } finally {
+      setBatchRunning(false);
     }
   };
 
@@ -799,12 +913,14 @@ function App() {
 
   /* ── Nav config ── */
   const navItems: { id: NavTab; label: string; icon: () => JSX.Element; badge?: string }[] = [
-    { id: 'watchlist',  label: 'Watchlist',  icon: Icon.signal, badge: signalSummary ? `${signalSummary.buy_count}` : undefined },
-    { id: 'workspace',  label: 'Workspace',  icon: Icon.user,   badge: savedPortfolios.length ? `${savedPortfolios.length}` : undefined },
-    { id: 'input',      label: 'Input',      icon: Icon.sliders },
-    { id: 'dashboard',  label: 'Dashboard',  icon: Icon.chart,  badge: result ? 'RDY' : undefined },
-    { id: 'data',       label: 'Data',       icon: Icon.db },
-    { id: 'overview',   label: 'Overview',   icon: Icon.grid },
+    { id: 'overview',  label: 'Overview',  icon: Icon.grid },
+    { id: 'watchlist', label: 'Watchlist', icon: Icon.signal, badge: signalSummary ? `${signalSummary.buy_count}` : undefined },
+    { id: 'workspace', label: 'Workspace', icon: Icon.user,   badge: savedPortfolios.length ? `${savedPortfolios.length}` : undefined },
+    ...(selectedManagerId ? [
+      { id: 'clients'   as NavTab, label: 'Clients',   icon: Icon.users,  badge: consumers.length ? `${consumers.length}` : undefined },
+      { id: 'input'     as NavTab, label: 'Input',     icon: Icon.sliders },
+      { id: 'dashboard' as NavTab, label: 'Dashboard', icon: Icon.chart,  badge: result ? 'RDY' : undefined },
+    ] : []),
   ];
 
   const activeLabel = navItems.find((n) => n.id === activeTab)?.label ?? '';
@@ -813,6 +929,12 @@ function App() {
     mainRef.current?.scrollTo({ top: 0, left: 0, behavior: 'auto' });
     window.scrollTo({ top: 0, left: 0, behavior: 'auto' });
   }, [activeTab, result]);
+
+  useEffect(() => {
+    if (!selectedManagerId && (activeTab === 'clients' || activeTab === 'input' || activeTab === 'dashboard')) {
+      setActiveTab('workspace');
+    }
+  }, [selectedManagerId]);
 
   /* ────────────────────────────────────────────────────────────── */
   return (
@@ -920,15 +1042,17 @@ function App() {
             {/* How it works */}
             <div className="panel">
               <div className="panel-head">
-                <div className="panel-title">System Architecture</div>
+                <div className="panel-title">System Flow</div>
               </div>
               <div style={{ padding: '1rem' }}>
                 <div className="steps-grid">
                   {[
-                    { n: '01', t: 'User Holdings', b: 'Enter NSE symbols and share quantities. Prices are fetched live from the market data feed.' },
-                    { n: '02', t: 'ML Signal Engine', b: 'XGBoost, Random Forest, and LSTM models output ranked buy/sell signals with confidence scores.' },
-                    { n: '03', t: 'Mandate Optimizer', b: 'Combines expected return, covariance, mandate profile, liquidity rules, and sector diversification limits.' },
-                    { n: '04', t: 'Manager Report', b: 'Outputs buy/sell decisions, Nigerian equity compliance checks, and an exportable fund manager report.' },
+                    { n: '01', t: 'Signal Watchlist', b: 'Browse ranked Nigerian equity buy and sell signals from the ML engine. The Watchlist is always accessible without logging in.' },
+                    { n: '02', t: 'Manager Login', b: 'Go to the Workspace tab to log in to an existing fund manager account or create a new one to unlock client management tools.' },
+                    { n: '03', t: 'Client Setup', b: 'From your manager dashboard, create a new client profile or select a saved client to begin or continue their portfolio workflow.' },
+                    { n: '04', t: 'Portfolio Input', b: "Enter the client's current holdings to rebalance, or provide a cash amount to construct a fresh portfolio from the signal universe." },
+                    { n: '05', t: 'Mandate & Optimization', b: 'Set risk profile, equity mandate, holding period, and target stocks, then run the ML optimizer to generate trade recommendations.' },
+                    { n: '06', t: 'Analytics & Save', b: 'Review trades, compliance checks, efficient frontier, diversification score, and risk attribution, then save the run to the client record.' },
                   ].map((s) => (
                     <div className="step-item" key={s.n}>
                       <div className="step-num">Step {s.n}</div>
@@ -936,6 +1060,27 @@ function App() {
                       <div className="step-body">{s.b}</div>
                     </div>
                   ))}
+                </div>
+              </div>
+            </div>
+
+            {/* Data freshness */}
+            <div className="panel">
+              <div className="panel-head">
+                <div className="panel-title">Data Freshness</div>
+              </div>
+              <div className="panel-body">
+                <div className="fresh-grid">
+                  <div className="fresh-item">
+                    <div className="metric-label">Signals generated</div>
+                    <div className="fresh-val">{fmtDateTime(signalSummary?.generated_at ?? null)}</div>
+                    <div className="fresh-badge">{fmtRelative(signalSummary?.generated_at ?? null)}</div>
+                  </div>
+                  <div className="fresh-item">
+                    <div className="metric-label">Prices last available</div>
+                    <div className="fresh-val">{fmtDate(priceUpdatedAt)}</div>
+                    <div className="fresh-badge">{fmtRelative(priceUpdatedAt)}</div>
+                  </div>
                 </div>
               </div>
             </div>
@@ -1813,202 +1958,566 @@ function App() {
         {/* ══ WORKSPACE ══ */}
         {activeTab === 'workspace' && (
           <>
-            <div className="grid-2">
-              <div className="panel">
-                <div className="panel-head">
-                  <div className="panel-title">Fund Manager Workspace</div>
-                  <div className="workspace-actions">
-                    {selectedManager && <span className="badge badge-blue">{selectedManager.firm}</span>}
-                    {selectedManager && (
-                      <>
-                        <button className="btn btn-ghost" style={{ fontSize: '10.5px', padding: '0.3rem 0.7rem' }} onClick={exitWorkspace}>Exit</button>
-                        <button className="btn btn-danger" style={{ fontSize: '10.5px', padding: '0.3rem 0.7rem' }} onClick={deleteActiveWorkspace}>Delete</button>
-                      </>
+            {!selectedManagerId ? (
+              /* ── MANAGER LOGIN / CREATE ACCOUNT ── */
+              <div style={{ maxWidth: '440px', margin: '0 auto', width: '100%', display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
+                <div style={{ textAlign: 'center', paddingTop: '0.25rem' }}>
+                  <div style={{ fontSize: '1.1rem', fontWeight: 600, color: 'var(--text)', marginBottom: '0.2rem' }}>Fund Manager Platform</div>
+                  <div style={{ fontSize: '13px', color: 'var(--text-3)' }}>
+                    {authView === 'register' ? 'Create your account to get started.' : 'Log in to your account to continue.'}
+                  </div>
+                </div>
+
+                {authView === 'register' ? (
+                  <>
+                    <div className="panel">
+                      <div className="panel-head">
+                        <div className="panel-title">Create Account</div>
+                      </div>
+                      <div className="panel-body" style={{ display: 'grid', gap: '0.75rem' }}>
+                        <div className="form-field">
+                          <div className="field-label">Full name</div>
+                          <input className="field-input" value={managerName} onChange={(e) => setManagerName(e.target.value)} placeholder="e.g. Amina Bello" />
+                        </div>
+                        <div className="form-field">
+                          <div className="field-label">Firm</div>
+                          <input className="field-input" value={managerFirm} onChange={(e) => setManagerFirm(e.target.value)} placeholder="e.g. Lagos Asset Management" />
+                        </div>
+                        <div className="form-field">
+                          <div className="field-label">Email address</div>
+                          <input className="field-input" type="email" value={managerEmail} onChange={(e) => setManagerEmail(e.target.value)} placeholder="you@example.com" />
+                        </div>
+                        <div className="form-field">
+                          <div className="field-label">Password <span style={{ color: 'var(--text-3)', fontWeight: 400, textTransform: 'none', letterSpacing: 0 }}>(min 8 characters)</span></div>
+                          <input className="field-input" type="password" value={managerPassword} onChange={(e) => setManagerPassword(e.target.value)} placeholder="Enter a password" />
+                        </div>
+                        <button className="btn btn-primary" onClick={createManagerAccount} disabled={managerPassword.length > 0 && managerPassword.length < 8}>Create Account</button>
+                        {managerPassword.length > 0 && managerPassword.length < 8 && (
+                          <div style={{ fontSize: '12px', color: '#b45309' }}>{managerPassword.length}/8 characters — password too short</div>
+                        )}
+                        {workspaceStatus && <div className="banner banner-ok">{workspaceStatus}</div>}
+                        {workspaceError && <div className="banner banner-error">{workspaceError}</div>}
+                      </div>
+                    </div>
+                    <div style={{ textAlign: 'center', fontSize: '13px', color: 'var(--text-3)' }}>
+                      Already have an account?{' '}
+                      <button
+                        style={{ background: 'none', border: 'none', padding: 0, color: '#2563eb', fontWeight: 600, fontSize: '13px', cursor: 'pointer' }}
+                        onClick={() => { setAuthView('login'); setWorkspaceError(null); setWorkspaceStatus(null); }}
+                      >
+                        Log in
+                      </button>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div className="panel">
+                      <div className="panel-head">
+                        <div className="panel-title">Log In</div>
+                      </div>
+                      <div className="panel-body" style={{ display: 'grid', gap: '0.75rem' }}>
+                        <div className="form-field">
+                          <div className="field-label">Email address</div>
+                          <input
+                            className="field-input"
+                            type="email"
+                            value={loginEmail}
+                            onChange={(e) => setLoginEmail(e.target.value)}
+                            placeholder="you@example.com"
+                            onKeyDown={(e) => e.key === 'Enter' && loginManager()}
+                          />
+                        </div>
+                        <div className="form-field">
+                          <div className="field-label">Password</div>
+                          <input
+                            className="field-input"
+                            type="password"
+                            value={loginPassword}
+                            onChange={(e) => setLoginPassword(e.target.value)}
+                            placeholder="Enter your password"
+                            onKeyDown={(e) => e.key === 'Enter' && loginManager()}
+                          />
+                        </div>
+                        <button className="btn btn-primary" onClick={loginManager}>Log In</button>
+                        {workspaceError && <div className="banner banner-error">{workspaceError}</div>}
+                      </div>
+                    </div>
+                    <div style={{ textAlign: 'center', fontSize: '13px', color: 'var(--text-3)' }}>
+                      Don't have an account?{' '}
+                      <button
+                        style={{ background: 'none', border: 'none', padding: 0, color: '#2563eb', fontWeight: 600, fontSize: '13px', cursor: 'pointer' }}
+                        onClick={() => { setAuthView('register'); setWorkspaceError(null); setWorkspaceStatus(null); }}
+                      >
+                        Create one
+                      </button>
+                    </div>
+                  </>
+                )}
+              </div>
+            ) : (
+              /* ── MANAGER DASHBOARD ── */
+              <>
+                {/* Manager identity bar */}
+                <div className="panel">
+                  <div className="panel-body" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.75rem' }}>
+                    <div>
+                      <div style={{ fontSize: '1rem', fontWeight: 600, color: 'var(--text)' }}>{selectedManager!.name}</div>
+                      <div style={{ fontSize: '12.5px', color: 'var(--text-3)', marginTop: '0.1rem' }}>
+                        {selectedManager!.firm}{selectedManager!.email ? ` · ${selectedManager!.email}` : ''}
+                      </div>
+                    </div>
+                    <div className="workspace-actions">
+                      <button className="btn btn-ghost" style={{ fontSize: '10.5px', padding: '0.3rem 0.7rem' }} onClick={exitWorkspace}>Switch Account</button>
+                      <button className="btn btn-danger" style={{ fontSize: '10.5px', padding: '0.3rem 0.7rem' }} onClick={deleteActiveWorkspace}>Delete Workspace</button>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Two primary actions */}
+                <div className="grid-2">
+                  {/* New client */}
+                  <div className="panel">
+                    <div className="panel-head">
+                      <div className="panel-title">New Client</div>
+                    </div>
+                    <div className="panel-body" style={{ display: 'grid', gap: '0.75rem' }}>
+                      <div className="form-field">
+                        <div className="field-label">Client name</div>
+                        <input className="field-input" value={consumerName} onChange={(e) => setConsumerName(e.target.value)} placeholder="e.g. Chinedu Okafor" />
+                      </div>
+                      <div className="form-field">
+                        <div className="field-label">Contact</div>
+                        <input className="field-input" value={consumerEmail} onChange={(e) => setConsumerEmail(e.target.value)} placeholder="optional email or phone" />
+                      </div>
+                      <div className="form-field">
+                        <div className="field-label">Portfolio status</div>
+                        <div className="risk-row">
+                          <button className={`risk-pill ${consumerPortfolioStatus === 'existing' ? 'active' : ''}`} onClick={() => setConsumerPortfolioStatus('existing')}>Has portfolio</button>
+                          <button className={`risk-pill ${consumerPortfolioStatus === 'new' ? 'active' : ''}`} onClick={() => setConsumerPortfolioStatus('new')}>No portfolio</button>
+                        </div>
+                      </div>
+                      <button
+                        className="btn btn-primary"
+                        onClick={async () => {
+                          const consumer = await registerConsumer();
+                          if (consumer) setActiveTab('input');
+                        }}
+                        disabled={!consumerName.trim()}
+                      >
+                        Add Client &amp; Continue
+                      </button>
+                      <button className="btn btn-ghost" onClick={() => { startNewConsumer(); setActiveTab('input'); }}>
+                        Continue without saving
+                      </button>
+                      {workspaceStatus && <div className="banner banner-ok">{workspaceStatus}</div>}
+                      {workspaceError && <div className="banner banner-error">{workspaceError}</div>}
+                    </div>
+                  </div>
+
+                  {/* Select existing client */}
+                  <div className="panel">
+                    <div className="panel-head">
+                      <div className="panel-title">Select Client</div>
+                      <span className="badge badge-blue">{consumers.length} client{consumers.length === 1 ? '' : 's'}</span>
+                    </div>
+                    {consumers.length > 0 ? (
+                      <div>
+                        {consumers.map((consumer) => (
+                          <button
+                            key={consumer.id}
+                            className="manager-login-row"
+                            onClick={() => { selectConsumer(consumer.id); setActiveTab('input'); }}
+                          >
+                            <div style={{ textAlign: 'left' }}>
+                              <div className="manager-login-name">{consumer.name}</div>
+                              <div className="manager-login-firm">
+                                {consumer.email || 'No contact'} · {consumer.consumer_has_portfolio ? 'Has portfolio' : 'New portfolio'}
+                                {(consumer.portfolio_count ?? 0) > 0 ? ` · ${consumer.portfolio_count} run${consumer.portfolio_count === 1 ? '' : 's'}` : ''}
+                              </div>
+                            </div>
+                            <Icon.chevronRight />
+                          </button>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="empty-state" style={{ padding: '2rem 1rem' }}>
+                        <div className="empty-icon"><Icon.user /></div>
+                        <div className="empty-state-title">No clients yet</div>
+                        <div className="empty-state-sub">Add a new client using the form on the left.</div>
+                      </div>
                     )}
                   </div>
                 </div>
-                <div className="panel-body" style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
-                  {managers.length > 0 && (
-                    <div className="form-field">
-                      <div className="field-label">Active manager</div>
-                      <select className="field-input" value={selectedManagerId} onChange={(e) => selectWorkspace(e.target.value)}>
-                        <option value="">Select workspace</option>
-                        {managers.map((manager) => (
-                          <option key={manager.id} value={manager.id}>{manager.name} — {manager.firm}</option>
-                        ))}
-                      </select>
+
+                {/* Save portfolio utility panel */}
+                <div className="panel">
+                  <div className="panel-head">
+                    <div className="panel-title">{consumerHasPortfolio ? 'Save Current Equity Portfolio' : 'Save New Consumer Portfolio'}</div>
+                    <div className="workspace-actions">
+                      <button className="btn btn-ghost" style={{ fontSize: '10.5px', padding: '0.3rem 0.7rem' }} onClick={() => setActiveTab('input')}>
+                        Go to Input
+                      </button>
+                      <button className="btn btn-ghost" style={{ fontSize: '10.5px', padding: '0.3rem 0.7rem' }} onClick={saveCurrentPortfolio}>
+                        {consumerHasPortfolio ? 'Save Current' : 'Save New'}
+                      </button>
                     </div>
-                  )}
-                  <div className="workspace-manager-card">
-                    <strong>{selectedManager ? selectedManager.name : 'No workspace selected'}</strong>
-                    <span>{selectedManager ? `${selectedManager.email || 'No contact email'} · Consumer ${consumerHasPortfolio ? 'has an existing portfolio' : 'needs a first portfolio'}` : 'Create a fund manager workspace to save multiple portfolios.'}</span>
                   </div>
-                </div>
-              </div>
-
-              <div className="panel">
-                <div className="panel-head">
-                  <div className="panel-title">Create Manager</div>
-                </div>
-                <div className="panel-body" style={{ display: 'grid', gap: '0.75rem' }}>
-                  <div className="form-field">
-                    <div className="field-label">Manager name</div>
-                    <input className="field-input" value={managerName} onChange={(e) => setManagerName(e.target.value)} placeholder="e.g. Amina Bello" />
-                  </div>
-                  <div className="form-field">
-                    <div className="field-label">Firm</div>
-                    <input className="field-input" value={managerFirm} onChange={(e) => setManagerFirm(e.target.value)} placeholder="e.g. Lagos Asset Management" />
-                  </div>
-                  <div className="form-field">
-                    <div className="field-label">Email</div>
-                    <input className="field-input" value={managerEmail} onChange={(e) => setManagerEmail(e.target.value)} placeholder="optional" />
-                  </div>
-                  <button className="btn btn-primary" onClick={createManagerAccount}>Create Workspace</button>
-                </div>
-              </div>
-            </div>
-
-              <div className="panel">
-                <div className="panel-head">
-                  <div className="panel-title">{consumerHasPortfolio ? 'Save Current Equity Portfolio' : 'Save New Consumer Portfolio'}</div>
-                <div className="workspace-actions">
-                  <button className="btn btn-ghost" style={{ fontSize: '10.5px', padding: '0.3rem 0.7rem' }} onClick={() => setActiveTab('input')}>
-                    Continue to Input
-                  </button>
-                  <button className="btn btn-ghost" style={{ fontSize: '10.5px', padding: '0.3rem 0.7rem' }} onClick={saveCurrentPortfolio}>
-                    {consumerHasPortfolio ? 'Save Current' : 'Save New'}
-                  </button>
-                </div>
-              </div>
-              <div className="panel-body">
-                <div className="grid-3">
-                  <div className="form-field">
-                    <div className="field-label">Managed consumer</div>
-                    <select className="field-input" value={selectedConsumerId} onChange={(e) => selectConsumer(e.target.value)} disabled={!selectedManagerId || consumers.length === 0}>
-                      <option value="">{consumers.length ? 'Select consumer' : 'No consumers registered'}</option>
-                      {consumers.map((consumer) => (
-                        <option key={consumer.id} value={consumer.id}>
-                          {consumer.name} — {consumer.consumer_has_portfolio ? 'has portfolio' : 'new portfolio'}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                  <div className="form-field">
-                    <div className="field-label">Portfolio name</div>
-                    <input className="field-input" value={portfolioName} onChange={(e) => setPortfolioName(e.target.value)} />
-                  </div>
-                  <div className="form-field">
-                    <div className="field-label">Consumer name</div>
-                    <input className="field-input" value={consumerName} onChange={(e) => setConsumerName(e.target.value)} placeholder="e.g. Chinedu Okafor" />
-                  </div>
-                  <div className="form-field">
-                    <div className="field-label">Consumer contact</div>
-                    <input className="field-input" value={consumerEmail} onChange={(e) => setConsumerEmail(e.target.value)} placeholder="optional email or phone" />
-                  </div>
-                  <div className="form-field">
-                    <div className="field-label">Consumer status</div>
-                    <select className="field-input" value={consumerPortfolioStatus} onChange={(e) => setConsumerPortfolioStatus(e.target.value as ConsumerPortfolioStatus)}>
-                      <option value="existing">Currently has portfolio</option>
-                      <option value="new">No portfolio yet</option>
-                    </select>
-                  </div>
-                  <div className="field-readonly">
-                    <div className="field-label">{consumerHasPortfolio ? 'Current value' : 'Initial cash'}</div>
-                    <div className="field-readonly-val">{fmtCcy(totalBudget)}</div>
-                  </div>
-                  {!consumerHasPortfolio && (
-                    <div className="form-field">
-                      <div className="field-label">Initial cash amount</div>
-                      <input className="field-input" type="number" min="1" step="10000" value={initialCashNaira === 0 ? '' : initialCashNaira} onChange={(e) => setInitialCashNaira(Number(e.target.value) || 0)} />
-                    </div>
-                  )}
-                  <div className="field-readonly">
-                    <div className="field-label">Latest run</div>
-                    <div className="field-readonly-val">{result ? result.compliance_report.overall_status.toUpperCase() : 'Not run'}</div>
-                  </div>
-                </div>
-                <div className="workspace-actions" style={{ marginTop: '0.75rem' }}>
-                  <button className="btn btn-ghost" onClick={startNewConsumer}>New Consumer</button>
-                  {!selectedConsumer && (
-                    <button className="btn btn-ghost" onClick={registerConsumer} disabled={!selectedManagerId || !consumerName.trim()}>
-                      Add Consumer
-                    </button>
-                  )}
-                  {selectedConsumer && (
-                    <>
-                      <button className="btn btn-ghost" onClick={exitConsumer}>Exit Consumer</button>
-                      <button className="btn btn-danger" onClick={deleteActiveConsumer}>Delete Consumer</button>
-                    </>
-                  )}
-                  {selectedConsumer && (
-                    <span className="badge badge-blue">{selectedConsumer.portfolio_count ?? 0} saved portfolio{(selectedConsumer.portfolio_count ?? 0) === 1 ? '' : 's'}</span>
-                  )}
-                </div>
-                {workspaceStatus && <div className="banner banner-ok">{workspaceStatus}</div>}
-                {workspaceError && <div className="banner banner-error">{workspaceError}</div>}
-              </div>
-            </div>
-
-            <div className="panel">
-              <div className="panel-head">
-                <div className="panel-title">Saved Portfolios</div>
-                <span className="badge badge-blue">{savedPortfolios.length} portfolio{savedPortfolios.length === 1 ? '' : 's'}</span>
-              </div>
-              {savedPortfolios.length > 0 ? (
-                <div className="workspace-list">
-                  {savedPortfolios.map((portfolio) => (
-                    <div className="workspace-portfolio" key={portfolio.id}>
-                      <div>
-                        <div className="watch-symbol">{portfolio.name}</div>
-                        <div className="watch-reason">
-                          {(portfolio.consumer_name || 'Unnamed consumer')} · {mandateLabels[portfolio.mandate_profile]} · {portfolio.risk_profile} · {(portfolio.consumer_has_portfolio ?? portfolio.holdings.length > 0) ? `${portfolio.holdings.length} holding${portfolio.holdings.length === 1 ? '' : 's'}` : `new portfolio from ${fmtCcy(portfolio.initial_cash_naira ?? 0)}`}
+                  <div className="panel-body">
+                    <div className="grid-3">
+                      <div className="form-field">
+                        <div className="field-label">Managed consumer</div>
+                        <select className="field-input" value={selectedConsumerId} onChange={(e) => selectConsumer(e.target.value)} disabled={!selectedManagerId || consumers.length === 0}>
+                          <option value="">{consumers.length ? 'Select consumer' : 'No consumers registered'}</option>
+                          {consumers.map((consumer) => (
+                            <option key={consumer.id} value={consumer.id}>
+                              {consumer.name} — {consumer.consumer_has_portfolio ? 'has portfolio' : 'new portfolio'}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                      <div className="form-field">
+                        <div className="field-label">Portfolio name</div>
+                        <input className="field-input" value={portfolioName} onChange={(e) => setPortfolioName(e.target.value)} />
+                      </div>
+                      <div className="form-field">
+                        <div className="field-label">Consumer name</div>
+                        <input className="field-input" value={consumerName} onChange={(e) => setConsumerName(e.target.value)} placeholder="e.g. Chinedu Okafor" />
+                      </div>
+                      <div className="form-field">
+                        <div className="field-label">Consumer contact</div>
+                        <input className="field-input" value={consumerEmail} onChange={(e) => setConsumerEmail(e.target.value)} placeholder="optional email or phone" />
+                      </div>
+                      <div className="form-field">
+                        <div className="field-label">Consumer status</div>
+                        <select className="field-input" value={consumerPortfolioStatus} onChange={(e) => setConsumerPortfolioStatus(e.target.value as ConsumerPortfolioStatus)}>
+                          <option value="existing">Currently has portfolio</option>
+                          <option value="new">No portfolio yet</option>
+                        </select>
+                      </div>
+                      <div className="field-readonly">
+                        <div className="field-label">{consumerHasPortfolio ? 'Current value' : 'Initial cash'}</div>
+                        <div className="field-readonly-val">{fmtCcy(totalBudget)}</div>
+                      </div>
+                      {!consumerHasPortfolio && (
+                        <div className="form-field">
+                          <div className="field-label">Initial cash amount</div>
+                          <input className="field-input" type="number" min="1" step="10000" value={initialCashNaira === 0 ? '' : initialCashNaira} onChange={(e) => setInitialCashNaira(Number(e.target.value) || 0)} />
                         </div>
-                        {portfolio.latest_result_summary && (
-                          <div className="workspace-run">
-                            Last run {fmtRelative(portfolio.latest_result_summary.generated_at)} · {portfolio.latest_result_summary.compliance_status} · Value {fmtCcy(portfolio.latest_result_summary.optimized_portfolio_value ?? portfolio.latest_result_summary.portfolio_value)} · Sharpe {portfolio.latest_result_summary.optimized_sharpe.toFixed(3)}
-                          </div>
-                        )}
-                      </div>
-                      <div className="workspace-actions">
-                        <button className="btn btn-ghost" onClick={() => loadSavedPortfolio(portfolio)}>Load</button>
-                        <button className="btn btn-primary" onClick={() => optimizeSavedPortfolio(portfolio)}>Optimize</button>
+                      )}
+                      <div className="field-readonly">
+                        <div className="field-label">Latest run</div>
+                        <div className="field-readonly-val">{result ? result.compliance_report.overall_status.toUpperCase() : 'Not run'}</div>
                       </div>
                     </div>
-                  ))}
+                    {workspaceStatus && <div className="banner banner-ok" style={{ marginTop: '0.75rem' }}>{workspaceStatus}</div>}
+                    {workspaceError && <div className="banner banner-error" style={{ marginTop: '0.75rem' }}>{workspaceError}</div>}
+                  </div>
                 </div>
-              ) : (
-                <div className="empty-state">
-                  <div className="empty-icon"><Icon.user /></div>
-                  <div className="empty-state-title">No saved portfolios</div>
-                  <div className="empty-state-sub">Save the current holdings to track optimization history for this fund manager.</div>
+
+                {/* Saved portfolios */}
+                <div className="panel">
+                  <div className="panel-head">
+                    <div className="panel-title">Saved Portfolios</div>
+                    <span className="badge badge-blue">{savedPortfolios.length} portfolio{savedPortfolios.length === 1 ? '' : 's'}</span>
+                  </div>
+                  {savedPortfolios.length > 0 ? (
+                    <div className="workspace-list">
+                      {savedPortfolios.map((portfolio) => (
+                        <div className="workspace-portfolio" key={portfolio.id}>
+                          <div>
+                            <div className="watch-symbol">{portfolio.name}</div>
+                            <div className="watch-reason">
+                              {(portfolio.consumer_name || 'Unnamed consumer')} · {mandateLabels[portfolio.mandate_profile]} · {portfolio.risk_profile} · {(portfolio.consumer_has_portfolio ?? portfolio.holdings.length > 0) ? `${portfolio.holdings.length} holding${portfolio.holdings.length === 1 ? '' : 's'}` : `new portfolio from ${fmtCcy(portfolio.initial_cash_naira ?? 0)}`}
+                            </div>
+                            {portfolio.latest_result_summary && (
+                              <div className="workspace-run">
+                                Last run {fmtRelative(portfolio.latest_result_summary.generated_at)} · {portfolio.latest_result_summary.compliance_status} · Value {fmtCcy(portfolio.latest_result_summary.optimized_portfolio_value ?? portfolio.latest_result_summary.portfolio_value)} · Sharpe {portfolio.latest_result_summary.optimized_sharpe.toFixed(3)}
+                              </div>
+                            )}
+                          </div>
+                          <div className="workspace-actions">
+                            <button className="btn btn-ghost" onClick={() => loadSavedPortfolio(portfolio)}>Load</button>
+                            <button className="btn btn-primary" onClick={() => optimizeSavedPortfolio(portfolio)}>Optimize</button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="empty-state">
+                      <div className="empty-icon"><Icon.user /></div>
+                      <div className="empty-state-title">No saved portfolios</div>
+                      <div className="empty-state-sub">Save holdings from the Input tab to track optimization history.</div>
+                    </div>
+                  )}
                 </div>
-              )}
-            </div>
+              </>
+            )}
           </>
         )}
 
-        {/* ══ DATA ══ */}
-        {activeTab === 'data' && (
-          <div className="panel">
-            <div className="panel-head">
-              <div className="panel-title">Data Freshness</div>
-            </div>
-            <div className="panel-body">
-              <div className="fresh-grid">
-                <div className="fresh-item">
-                  <div className="metric-label">Signals generated</div>
-                  <div className="fresh-val">{fmtDateTime(signalSummary?.generated_at ?? null)}</div>
-                  <div className="fresh-badge">{fmtRelative(signalSummary?.generated_at ?? null)}</div>
-                </div>
-                <div className="fresh-item">
-                  <div className="metric-label">Prices updated</div>
-                  <div className="fresh-val">{fmtDateTime(priceUpdatedAt)}</div>
-                  <div className="fresh-badge">{fmtRelative(priceUpdatedAt)}</div>
+        {/* ══ CLIENTS ══ */}
+        {activeTab === 'clients' && (
+          <>
+            {/* Top bar: manager selector + batch actions */}
+            <div className="panel">
+              <div className="panel-head">
+                <div className="panel-title">Client Portfolios</div>
+                <div className="workspace-actions">
+                  {selectedManager && <span className="badge badge-blue">{selectedManager.firm}</span>}
+                  {batchSelected.size > 0 && (
+                    <>
+                      <span className="badge badge-hist">{batchSelected.size} selected</span>
+                      <button
+                        className="btn btn-ghost"
+                        style={{ fontSize: '10.5px', padding: '0.3rem 0.7rem' }}
+                        onClick={clearBatchSelection}
+                      >
+                        Clear
+                      </button>
+                      <button
+                        className="btn btn-primary"
+                        style={{ fontSize: '10.5px', padding: '0.3rem 0.7rem' }}
+                        onClick={runBatchOptimize}
+                        disabled={batchRunning || !selectedManagerId}
+                      >
+                        {batchRunning ? 'Running…' : `Optimize ${batchSelected.size} Portfolio${batchSelected.size === 1 ? '' : 's'}`}
+                      </button>
+                    </>
+                  )}
+                  {batchSelected.size === 0 && savedPortfolios.length > 0 && (
+                    <button
+                      className="btn btn-ghost"
+                      style={{ fontSize: '10.5px', padding: '0.3rem 0.7rem' }}
+                      onClick={selectAllPortfolios}
+                    >
+                      Select All
+                    </button>
+                  )}
                 </div>
               </div>
+              <div className="panel-body" style={{ paddingBottom: '0.5rem' }}>
+                {managers.length > 0 && (
+                  <div className="form-field" style={{ maxWidth: '320px' }}>
+                    <div className="field-label">Active manager</div>
+                    <select className="field-input" value={selectedManagerId} onChange={(e) => selectWorkspace(e.target.value)}>
+                      <option value="">Select workspace</option>
+                      {managers.map((m) => (
+                        <option key={m.id} value={m.id}>{m.name} — {m.firm}</option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+              </div>
             </div>
-          </div>
+
+            {/* Batch result banner */}
+            {batchResult && (
+              <div className={`banner ${batchResult.failed > 0 ? 'banner-warn' : 'banner-ok'}`}>
+                <p>
+                  Batch complete — <strong>{batchResult.succeeded}</strong> succeeded
+                  {batchResult.failed > 0 && <>, <strong>{batchResult.failed}</strong> failed</>}.
+                </p>
+                {batchResult.results.filter((r) => !r.success).map((r) => (
+                  <p key={r.portfolio_id} style={{ fontSize: '12px', marginTop: '0.2rem' }}>
+                    ✕ {r.consumer_name || r.portfolio_id}: {r.error}
+                  </p>
+                ))}
+              </div>
+            )}
+
+            {workspaceError && <div className="banner banner-error">{workspaceError}</div>}
+
+            {/* Portfolio list — grouped by consumer */}
+            {!selectedManagerId ? (
+              <div className="empty-state">
+                <div className="empty-icon"><Icon.users /></div>
+                <div className="empty-state-title">No workspace selected</div>
+                <div className="empty-state-sub">Select a fund manager workspace above to view client portfolios.</div>
+              </div>
+            ) : savedPortfolios.length === 0 ? (
+              <div className="empty-state">
+                <div className="empty-icon"><Icon.users /></div>
+                <div className="empty-state-title">No saved portfolios</div>
+                <div className="empty-state-sub">Save client portfolios from the Workspace tab to track them here.</div>
+                <button className="btn btn-primary" style={{ marginTop: '1rem' }} onClick={() => setActiveTab('workspace')}>
+                  Go to Workspace
+                </button>
+              </div>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+                {savedPortfolios.map((portfolio) => {
+                  const isExpanded = expandedPortfolioId === portfolio.id;
+                  const runs: any[] = portfolioRuns[portfolio.id] ?? [];
+                  const isLoadingRuns = runsLoading === portfolio.id;
+                  const isChecked = batchSelected.has(portfolio.id);
+                  const summary = portfolio.latest_result_summary;
+
+                  return (
+                    <div
+                      key={portfolio.id}
+                      className="panel"
+                      style={{ border: isChecked ? '1px solid var(--accent)' : undefined }}
+                    >
+                      {/* Portfolio header row */}
+                      <div
+                        className="panel-head"
+                        style={{ cursor: 'pointer', userSelect: 'none' }}
+                        onClick={() => loadPortfolioRuns(portfolio.id)}
+                      >
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', minWidth: 0 }}>
+                          {/* Batch select checkbox */}
+                          <input
+                            type="checkbox"
+                            checked={isChecked}
+                            style={{ width: '13px', height: '13px', cursor: 'pointer', flexShrink: 0, accentColor: 'var(--accent)' }}
+                            onClick={(e) => e.stopPropagation()}
+                            onChange={() => toggleBatchSelect(portfolio.id)}
+                          />
+                          <div style={{ minWidth: 0 }}>
+                            <div className="panel-title" style={{ fontSize: '13px' }}>{portfolio.name}</div>
+                            <div style={{ fontSize: '12px', color: 'var(--text-3)', marginTop: '1px' }}>
+                              {portfolio.consumer_name || 'Unnamed client'} · {mandateLabels[portfolio.mandate_profile]} · {portfolio.risk_profile}
+                            </div>
+                          </div>
+                        </div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', flexShrink: 0 }}>
+                          {summary && (
+                            <span className={`badge ${getComplianceBadge(summary.compliance_status as any).cls}`} style={{ fontSize: '10.5px' }}>
+                              {summary.compliance_status}
+                            </span>
+                          )}
+                          {summary && (
+                            <span style={{ fontSize: '12px', color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>
+                              {fmtCcy(summary.optimized_portfolio_value ?? summary.portfolio_value)}
+                            </span>
+                          )}
+                          <div style={{ width: '14px', height: '14px', color: 'var(--text-3)', transform: isExpanded ? 'rotate(180deg)' : 'none', transition: 'transform 150ms' }}>
+                            <Icon.chevron />
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Expanded: latest summary + run history */}
+                      {isExpanded && (
+                        <div>
+                          {/* Latest snapshot metrics */}
+                          {summary && (
+                            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '1px', background: 'var(--border)', borderBottom: '1px solid var(--border)' }}>
+                              {[
+                                { label: 'Portfolio value',  value: fmtCcy(summary.optimized_portfolio_value ?? summary.portfolio_value) },
+                                { label: 'Expected return',  value: fmtPct(summary.optimized_expected_return) },
+                                { label: 'Sharpe ratio',     value: summary.optimized_sharpe.toFixed(3) },
+                                { label: 'Last run',         value: fmtRelative(summary.generated_at) },
+                              ].map((m) => (
+                                <div key={m.label} className="metric-card" style={{ padding: '0.65rem 0.9rem' }}>
+                                  <div className="metric-label">{m.label}</div>
+                                  <div style={{ fontFamily: 'var(--font-mono)', fontSize: '13.5px', fontWeight: 600, color: 'var(--text)', marginTop: '0.2rem' }}>{m.value}</div>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+
+                          {/* Quick-action buttons */}
+                          <div style={{ display: 'flex', gap: '0.5rem', padding: '0.65rem 1rem', borderBottom: '1px solid var(--border)', flexWrap: 'wrap' }}>
+                            <button className="btn btn-ghost" style={{ fontSize: '11px', padding: '0.3rem 0.7rem' }} onClick={() => loadSavedPortfolio(portfolio)}>
+                              Load to Input
+                            </button>
+                            <button className="btn btn-primary" style={{ fontSize: '11px', padding: '0.3rem 0.7rem' }} onClick={() => optimizeSavedPortfolio(portfolio)}>
+                              Optimize Now
+                            </button>
+                            {summary?.added_symbols?.length > 0 && (
+                              <span style={{ fontSize: '11.5px', color: 'var(--text-3)', alignSelf: 'center' }}>
+                                Last added: {summary.added_symbols.slice(0, 4).join(', ')}{summary.added_symbols.length > 4 ? ` +${summary.added_symbols.length - 4}` : ''}
+                              </span>
+                            )}
+                            {summary?.removed_symbols?.length > 0 && (
+                              <span style={{ fontSize: '11.5px', color: 'var(--red-400)', alignSelf: 'center' }}>
+                                Removed: {summary.removed_symbols.slice(0, 4).join(', ')}{summary.removed_symbols.length > 4 ? ` +${summary.removed_symbols.length - 4}` : ''}
+                              </span>
+                            )}
+                          </div>
+
+                          {/* Run history */}
+                          <div style={{ padding: '0.5rem 0' }}>
+                            <div style={{ padding: '0.4rem 1rem 0.3rem', fontSize: '10.5px', fontWeight: 600, letterSpacing: '1px', textTransform: 'uppercase', color: 'var(--text-3)', display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+                              Portfolio State History ({runs.length} snapshot{runs.length === 1 ? '' : 's'})
+                            </div>
+                            {isLoadingRuns ? (
+                              <div style={{ padding: '1rem', fontSize: '12.5px', color: 'var(--text-3)' }}>Loading history…</div>
+                            ) : runs.length === 0 ? (
+                              <div style={{ padding: '0.75rem 1rem', fontSize: '12.5px', color: 'var(--text-3)' }}>
+                                No runs recorded yet. Click "Optimize Now" to record the first snapshot.
+                              </div>
+                            ) : (
+                              <div style={{ overflowX: 'auto', overflowY: 'auto', maxHeight: '220px' }}>
+                                <table className="data-table">
+                                  <thead style={{ position: 'sticky', top: 0, zIndex: 1 }}>
+                                    <tr>
+                                      <th style={{ width: '2.5rem' }}>#</th>
+                                      <th>Date &amp; Time</th>
+                                      <th>Portfolio Value</th>
+                                      <th>Post-Trade Value</th>
+                                      <th>Exp. Return</th>
+                                      <th>Sharpe</th>
+                                      <th>Compliance</th>
+                                      <th>Holdings Added / Removed</th>
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    {runs.map((run: any, idx: number) => {
+                                      const s = run.summary;
+                                      if (!s) return null;
+                                      const badge = getComplianceBadge(s.compliance_status);
+                                      const added: string[] = s.added_symbols ?? [];
+                                      const removed: string[] = s.removed_symbols ?? [];
+                                      const runDate = run.created_at ?? s.generated_at;
+                                      const runNum = runs.length - idx;
+                                      return (
+                                        <tr key={run.id}>
+                                          <td style={{ color: 'var(--text-3)', fontSize: '11px', fontFamily: 'var(--font-mono)' }}>{runNum}</td>
+                                          <td style={{ whiteSpace: 'nowrap', fontFamily: 'var(--font-mono)', fontSize: '11.5px' }}>
+                                            {fmtDateTime(runDate)}
+                                          </td>
+                                          <td style={{ fontFamily: 'var(--font-mono)', fontSize: '11.5px' }}>{fmtCcy(s.portfolio_value)}</td>
+                                          <td style={{ fontFamily: 'var(--font-mono)', fontSize: '11.5px' }}>{fmtCcy(s.optimized_portfolio_value ?? s.portfolio_value)}</td>
+                                          <td className={s.optimized_expected_return >= 0 ? 'up' : 'down'} style={{ fontFamily: 'var(--font-mono)', fontSize: '11.5px' }}>
+                                            {fmtPct(s.optimized_expected_return)}
+                                          </td>
+                                          <td style={{ fontFamily: 'var(--font-mono)', fontSize: '11.5px' }}>{s.optimized_sharpe.toFixed(3)}</td>
+                                          <td><span className={`badge ${badge.cls}`} style={{ fontSize: '10px' }}>{s.compliance_status}</span></td>
+                                          <td style={{ fontSize: '11px' }}>
+                                            {added.length > 0 && (
+                                              <span style={{ color: 'var(--green-300)', marginRight: '0.4rem' }}>
+                                                +{added.slice(0, 3).join(', ')}{added.length > 3 ? ` +${added.length - 3}` : ''}
+                                              </span>
+                                            )}
+                                            {removed.length > 0 && (
+                                              <span style={{ color: 'var(--red-400)' }}>
+                                                −{removed.slice(0, 3).join(', ')}{removed.length > 3 ? ` +${removed.length - 3}` : ''}
+                                              </span>
+                                            )}
+                                            {added.length === 0 && removed.length === 0 && (
+                                              <span style={{ color: 'var(--text-3)' }}>—</span>
+                                            )}
+                                          </td>
+                                        </tr>
+                                      );
+                                    })}
+                                  </tbody>
+                                </table>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </>
         )}
+
 
       </main>
     </div>
