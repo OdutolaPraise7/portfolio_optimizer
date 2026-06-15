@@ -25,6 +25,7 @@ from portfolio_store import (
     PortfolioNotFoundError,
     PortfolioStoreError,
     PortfolioStoreValidationError,
+    apply_optimised_holdings,
     authenticate_manager,
     create_consumer,
     create_manager,
@@ -452,6 +453,28 @@ def optimize_saved_portfolio(portfolio_id: str) -> dict:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except optimizer.SignalStoreError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+class ApplyOptimisedRequest(BaseModel):
+    result: Dict[str, Any] = Field(..., description="Optimization result whose allocations become the new holdings")
+
+
+@app.post("/portfolios/{portfolio_id}/apply-optimised")
+def apply_optimised_portfolio(portfolio_id: str, payload: ApplyOptimisedRequest) -> dict:
+    """Replace the saved portfolio's holdings with the optimised allocations and record a run."""
+    try:
+        result = payload.result
+        allocations = result.get("optimized_allocations", [])
+        portfolio_value = result.get("optimized_portfolio_value") or result.get("current_portfolio_value", 0)
+        optimised_holdings = [
+            {"symbol": a["symbol"], "amount_naira": a["optimized_weight"] * portfolio_value}
+            for a in allocations
+            if a.get("action") != "exit"
+        ]
+        portfolio = apply_optimised_holdings(portfolio_id, optimised_holdings, result)
+        return {"portfolio": portfolio}
+    except PortfolioStoreError as exc:
+        raise _handle_store_error(exc) from exc
 
 
 # ── BATCH OPTIMIZATION ────────────────────────────────────────────────────────

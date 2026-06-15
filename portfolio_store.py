@@ -441,3 +441,44 @@ def list_runs(portfolio_id: str, store_file: str | Path | None = None) -> List[D
         data = _load_store(store_file)
         runs = [run for run in data["runs"] if run["portfolio_id"] == portfolio_id]
         return sorted(runs, key=lambda item: item.get("created_at", ""), reverse=True)
+
+
+def apply_optimised_holdings(
+    portfolio_id: str,
+    optimised_holdings: List[Dict[str, Any]],
+    result: Dict[str, Any],
+    store_file: str | Path | None = None,
+) -> Dict[str, Any]:
+    """Replace portfolio holdings with the optimised allocations and record the run."""
+    now = _now()
+    with _LOCK:
+        data = _load_store(store_file)
+        portfolio = next((p for p in data["portfolios"] if p["id"] == portfolio_id), None)
+        if portfolio is None:
+            raise PortfolioNotFoundError(f"Portfolio not found: {portfolio_id}")
+
+        portfolio["holdings"] = optimised_holdings
+        portfolio["consumer_has_portfolio"] = True
+        portfolio["updated_at"] = now
+
+        consumer_id = portfolio.get("consumer_id")
+        if consumer_id:
+            for consumer in data["consumers"]:
+                if consumer["id"] == consumer_id:
+                    consumer["consumer_has_portfolio"] = True
+                    consumer["updated_at"] = now
+                    break
+
+        run = {
+            "id": _new_id("run"),
+            "manager_id": portfolio["manager_id"],
+            "portfolio_id": portfolio_id,
+            "created_at": now,
+            "result": result,
+            "summary": _summary_from_result(result),
+            "applied": True,
+        }
+        portfolio["latest_result_summary"] = run["summary"]
+        data["runs"].append(run)
+        _save_store(data, store_file)
+        return portfolio

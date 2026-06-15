@@ -276,6 +276,9 @@ function App() {
   const [managerPassword, setManagerPassword] = useState('');
   const [authView, setAuthView] = useState<'register' | 'login'>('register');
 
+  const [activePortfolioId, setActivePortfolioId] = useState<string | null>(null);
+  const [applyingOptimised, setApplyingOptimised] = useState(false);
+
   // Clients tab state
   const [expandedPortfolioId, setExpandedPortfolioId] = useState<string | null>(null);
   const [portfolioRuns, setPortfolioRuns] = useState<Record<string, any[]>>({});
@@ -754,6 +757,7 @@ function App() {
       await refreshPortfolios(selectedManagerId);
       await refreshConsumers(selectedManagerId);
       if (data.portfolio?.consumer_id) setSelectedConsumerId(data.portfolio.consumer_id);
+      if (data.portfolio?.id) setActivePortfolioId(data.portfolio.id);
       setWorkspaceStatus(`Saved ${data.portfolio.name}.`);
       setActiveTab('workspace');
     } catch (e) {
@@ -784,6 +788,7 @@ function App() {
     setSelectedConsumerId(portfolio.consumer_id ?? '');
     setConsumerName(portfolio.consumer_name ?? '');
     setConsumerEmail(portfolio.consumer_email ?? '');
+    setActivePortfolioId(portfolio.id);
     setActiveTab('input');
     setWorkspaceStatus(`Loaded ${portfolio.name}.`);
   };
@@ -795,12 +800,91 @@ function App() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail ?? 'Could not optimize saved portfolio.');
       setResult(data.result);
+      setActivePortfolioId(portfolio.id);
+      setConsumerName(portfolio.consumer_name ?? '');
+      setConsumerEmail(portfolio.consumer_email ?? '');
+      setSelectedConsumerId(portfolio.consumer_id ?? '');
       await refreshPortfolios(portfolio.manager_id);
       setWorkspaceStatus(`Optimization recorded for ${portfolio.name}.`);
       setActiveTab('dashboard');
     } catch (e) {
       setWorkspaceError(friendlyErrorMessage(e instanceof Error ? e.message : '', 'Could not optimize saved portfolio.'));
       setWorkspaceStatus(null);
+    }
+  };
+
+  const applyOptimisedPortfolio = async () => {
+    if (!result || !selectedManagerId) return;
+    setApplyingOptimised(true);
+    setWorkspaceError(null);
+    try {
+      let portfolioId = activePortfolioId;
+
+      if (!portfolioId) {
+        // No saved portfolio yet — save the current inputs with optimised holdings first
+        if (!consumerName.trim()) {
+          setWorkspaceError('Enter a consumer name before applying the optimised portfolio.');
+          return;
+        }
+        const optHoldings = result.optimized_allocations
+          .filter((a) => a.action !== 'exit')
+          .map((a) => ({ symbol: a.symbol, amount_naira: a.optimized_weight * optimizedPortfolioValue }));
+        const saveRes = await fetch(`${API_BASE_URL}/fund-managers/${selectedManagerId}/portfolios`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            name: portfolioName,
+            consumer_id: selectedConsumerId,
+            consumer_name: consumerName,
+            consumer_email: consumerEmail,
+            holdings: optHoldings,
+            risk_profile: riskProfile,
+            mandate_profile: mandateProfile,
+            allow_new_stocks: effectiveAllowNewStocks,
+            max_new_stocks: Math.max(1, effectiveStockTarget),
+            rebalance_frequency: rebalanceFrequency,
+            holding_period_days: holdingPeriodDays,
+            consumer_has_portfolio: true,
+            initial_cash_naira: null,
+            latest_result: result,
+          }),
+        });
+        const saveData = await saveRes.json();
+        if (!saveRes.ok) throw new Error(saveData.detail ?? 'Could not save portfolio.');
+        portfolioId = saveData.portfolio.id;
+        setActivePortfolioId(portfolioId);
+        if (saveData.portfolio?.consumer_id) setSelectedConsumerId(saveData.portfolio.consumer_id);
+      } else {
+        // Update the existing portfolio's holdings to the optimised allocations
+        const res = await fetch(`${API_BASE_URL}/portfolios/${portfolioId}/apply-optimised`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ result }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail ?? 'Could not apply optimised portfolio.');
+      }
+
+      // Update frontend holdings to the optimised state
+      const newHoldings = result.optimized_allocations
+        .filter((a) => a.action !== 'exit')
+        .map((a) => {
+          const price = a.latest_price ?? prices[a.symbol] ?? 0;
+          return {
+            symbol: a.symbol,
+            quantity: price > 0 ? (a.optimized_weight * optimizedPortfolioValue) / price : 0,
+          };
+        });
+      setHoldings(newHoldings.length > 0 ? newHoldings : initialHoldings);
+      setConsumerPortfolioStatus('existing');
+
+      await refreshPortfolios(selectedManagerId);
+      await refreshConsumers(selectedManagerId);
+      setWorkspaceStatus(`${consumerName || 'Client'}'s portfolio updated to optimised allocations.`);
+    } catch (e) {
+      setWorkspaceError(e instanceof Error ? e.message : 'Could not apply optimised portfolio.');
+    } finally {
+      setApplyingOptimised(false);
     }
   };
 
@@ -1408,6 +1492,38 @@ function App() {
         {activeTab === 'dashboard' && (
           result ? (
             <>
+              {/* Client identity + apply banner */}
+              <div className="panel">
+                <div className="panel-head" style={{ flexWrap: 'wrap', gap: '0.5rem' }}>
+                  <div>
+                    <div className="panel-title" style={{ fontSize: '1rem' }}>
+                      {consumerName ? `${consumerName}'s Portfolio` : 'Optimised Portfolio'}
+                    </div>
+                    <div style={{ fontSize: '11px', color: 'var(--text-3)', marginTop: '0.2rem' }}>
+                      {result.fund_manager_report.mandate_label} · {result.fund_manager_report.generated_at ? fmtDateTime(result.fund_manager_report.generated_at) : ''}
+                    </div>
+                  </div>
+                  <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', flexWrap: 'wrap' }}>
+                    {selectedManagerId && (
+                      <button
+                        className="btn btn-primary"
+                        style={{ fontSize: '10.5px', padding: '0.4rem 1rem' }}
+                        onClick={applyOptimisedPortfolio}
+                        disabled={applyingOptimised}
+                        title={activePortfolioId ? 'Update this client\'s saved portfolio to the optimised allocations' : 'Save and apply the optimised allocations as this client\'s current portfolio'}
+                      >
+                        {applyingOptimised ? 'Applying…' : `Apply Optimised to ${consumerName || 'Client'}`}
+                      </button>
+                    )}
+                    <button className="btn btn-ghost" style={{ fontSize: '10.5px', padding: '0.4rem 0.8rem' }} onClick={exportResults}>
+                      Export CSV
+                    </button>
+                  </div>
+                </div>
+                {workspaceStatus && <div className="banner banner-ok" style={{ margin: '0 0.75rem 0.75rem' }}>{workspaceStatus}</div>}
+                {workspaceError && <div className="banner banner-error" style={{ margin: '0 0.75rem 0.75rem' }}>{workspaceError}</div>}
+              </div>
+
               <div className="metric-strip" style={{ gridTemplateColumns: 'repeat(3, 1fr)' }}>
                 <div className="metric-card">
                   <div className="metric-label">Current Portfolio Value</div>
